@@ -423,11 +423,13 @@ impl Orchestrator {
 
         self.set_agent_status(agent_id, AgentStatus::Done);
 
+        let cleaned_output = self.clean_agent_output(&full_agent_response);
+
         let duration_ms = step_start_instant.elapsed().as_millis() as u64;
-        let preview = if full_agent_response.len() > 120 {
-            format!("{}...", &full_agent_response[..120].replace('\n', " "))
+        let preview = if cleaned_output.len() > 120 {
+            format!("{}...", &cleaned_output[..120].replace('\n', " "))
         } else {
-            full_agent_response.replace('\n', " ")
+            cleaned_output.replace('\n', " ")
         };
 
         self.emit(OrchestratorEvent::WorkflowStepFinished {
@@ -440,30 +442,64 @@ impl Orchestrator {
             timestamp: Utc::now(),
         });
 
-        Ok(full_agent_response.trim().to_string())
+        Ok(if cleaned_output.is_empty() { full_agent_response.trim().to_string() } else { cleaned_output })
     }
 
-    /// Extract JSON tool invocation formatted as ```json {"tool": "...", "arguments": { ... }} ``` or `{"tool": "..."}`
+    /// Clean reasoning scratchpad tags (<think>...</think>) or leaked XML tool call tags from final output
+    fn clean_agent_output(&self, text: &str) -> String {
+        let think_re = Regex::new(r"(?s)<think>.*?</think>").unwrap();
+        let stripped = think_re.replace_all(text, "");
+
+        let tool_call_re = Regex::new(r"(?s)<tool_call>.*?</tool_call>").unwrap();
+        let stripped2 = tool_call_re.replace_all(&stripped, "");
+
+        stripped2.trim().to_string()
+    }
+
+    /// Extract JSON tool invocation formatted as <tool_call>...</tool_call>, ```json ... ``` or {"tool"/"name": "...", "arguments": { ... }}
     fn parse_tool_call(&self, text: &str) -> Option<(String, serde_json::Value)> {
-        let json_codeblock_re = Regex::new(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```").ok()?;
-        for cap in json_codeblock_re.captures_iter(text) {
-            if let Some(matched) = cap.get(1) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(matched.as_str()) {
-                    if let Some(tool_name) = val.get("tool").and_then(|t| t.as_str()) {
-                        let args = val.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-                        return Some((tool_name.to_string(), args));
+        // 1. Check for <tool_call> XML tags (used by Qwen, DeepSeek, and Llama)
+        if let Ok(tool_call_tag_re) = Regex::new(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>") {
+            for cap in tool_call_tag_re.captures_iter(text) {
+                if let Some(matched) = cap.get(1) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(matched.as_str()) {
+                        let tool_name = val.get("name")
+                            .or_else(|| val.get("tool"))
+                            .and_then(|t| t.as_str());
+                        if let Some(name) = tool_name {
+                            let args = val.get("arguments").or_else(|| val.get("parameters")).cloned().unwrap_or(serde_json::json!({}));
+                            return Some((name.to_string(), args));
+                        }
                     }
                 }
             }
         }
 
-        // Try raw JSON regex
-        let raw_json_re = Regex::new(r#"\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}"#).ok()?;
-        if let Some(cap) = raw_json_re.captures(text) {
-            let tool_name = cap.get(1)?.as_str().to_string();
-            let args_str = cap.get(2)?.as_str();
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
-                return Some((tool_name, args));
+        // 2. Check for markdown codeblock: ```json {"tool"/"name": "...", "arguments": {...}} ```
+        if let Ok(json_codeblock_re) = Regex::new(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```") {
+            for cap in json_codeblock_re.captures_iter(text) {
+                if let Some(matched) = cap.get(1) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(matched.as_str()) {
+                        let tool_name = val.get("tool")
+                            .or_else(|| val.get("name"))
+                            .and_then(|t| t.as_str());
+                        if let Some(name) = tool_name {
+                            let args = val.get("arguments").or_else(|| val.get("parameters")).cloned().unwrap_or(serde_json::json!({}));
+                            return Some((name.to_string(), args));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Try raw JSON regex: {"name" / "tool": "...", "arguments": {...}}
+        if let Ok(raw_json_re) = Regex::new(r#"\{\s*"(?:tool|name)"\s*:\s*"([^"]+)"\s*,\s*"(?:arguments|parameters)"\s*:\s*(\{[\s\S]*?\})\s*\}"#) {
+            if let Some(cap) = raw_json_re.captures(text) {
+                let tool_name = cap.get(1)?.as_str().to_string();
+                let args_str = cap.get(2)?.as_str();
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
+                    return Some((tool_name, args));
+                }
             }
         }
 
