@@ -34,9 +34,9 @@ impl TopologyMode {
 
     pub fn description(&self) -> &'static str {
         match self {
-            TopologyMode::Hierarchical => "Planner breaks task down, delegates to specialists, and aggregates",
-            TopologyMode::AssemblyLine => "Linear chain of Planner -> Scout -> Engineer -> Critic -> Synthesizer",
-            TopologyMode::DebateReview => "Engineer designs solution, Critic rigorously stress-tests, Engineer refines",
+            TopologyMode::Hierarchical => "Scout researches context -> Architect plans -> Engineer codes -> Critic audits -> Synthesizer delivers",
+            TopologyMode::AssemblyLine => "Linear chain: Scout -> Architect -> Engineer -> Critic -> Synthesizer",
+            TopologyMode::DebateReview => "Scout researches -> Engineer drafts -> Critic audits -> Engineer refines -> Synthesizer delivers",
             TopologyMode::DirectCoder => "Direct single-agent with tool execution access",
         }
     }
@@ -60,16 +60,40 @@ impl Orchestrator {
         tools: ToolRegistry,
         event_tx: Option<UnboundedSender<OrchestratorEvent>>,
     ) -> Self {
+        Self::with_models(
+            topology,
+            provider,
+            default_model,
+            default_model,
+            default_model,
+            default_model,
+            default_model,
+            tools,
+            event_tx,
+        )
+    }
+
+    pub fn with_models(
+        topology: TopologyMode,
+        provider: Arc<dyn LlmProvider>,
+        planner_model: &str,
+        researcher_model: &str,
+        coder_model: &str,
+        critic_model: &str,
+        synthesizer_model: &str,
+        tools: ToolRegistry,
+        event_tx: Option<UnboundedSender<OrchestratorEvent>>,
+    ) -> Self {
         let mut agents = HashMap::new();
 
-        let planner = Agent::planner(default_model);
-        let researcher = Agent::researcher(default_model);
-        let coder = Agent::coder(default_model);
-        let critic = Agent::critic(default_model);
-        let synthesizer = Agent::synthesizer(default_model);
+        let researcher = Agent::researcher(researcher_model);
+        let planner = Agent::planner(planner_model);
+        let coder = Agent::coder(coder_model);
+        let critic = Agent::critic(critic_model);
+        let synthesizer = Agent::synthesizer(synthesizer_model);
 
-        agents.insert(planner.config.id.clone(), planner);
         agents.insert(researcher.config.id.clone(), researcher);
+        agents.insert(planner.config.id.clone(), planner);
         agents.insert(coder.config.id.clone(), coder);
         agents.insert(critic.config.id.clone(), critic);
         agents.insert(synthesizer.config.id.clone(), synthesizer);
@@ -446,61 +470,67 @@ impl Orchestrator {
         None
     }
 
-    /// Topology 1: Hierarchical Swarm
+    /// Topology 1: Hierarchical Swarm (Researcher -> Planner -> Engineer -> Critic -> Synthesizer)
     async fn run_hierarchical_swarm(&mut self, user_goal: &str) -> Result<String> {
-        let plan_prompt = format!(
-            "Goal: {}\n\nDecompose this goal into a high-precision architectural blueprint, technical requirements, edge cases, and execution strategy.",
+        // Step 1: Research and context exploration
+        let research_prompt = format!(
+            "User Goal: {}\n\nInvestigate relevant project files, directory structure, schemas, APIs, and technical requirements needed to achieve this goal. Gather factual context and detail any constraints.",
             user_goal
         );
-        let plan = self.run_agent_step_with_retry("planner", 1, "Architectural Blueprint & Plan", &plan_prompt).await?;
-        self.blackboard.set("plan", &plan).await;
-
-        let research_prompt = format!(
-            "User Goal: {}\n\nArchitectural Plan:\n{}\n\nInvestigate relevant local project files or system specifications needed for this implementation.",
-            user_goal, plan
-        );
-        let research = self.run_agent_step_with_retry("researcher", 2, "Context & Tool Exploration", &research_prompt).await?;
+        let research = self.run_agent_step_with_retry("researcher", 1, "Context Exploration & Fact Scouting", &research_prompt).await?;
         self.blackboard.set("research", &research).await;
 
+        // Step 2: Strategic planning based on research findings
+        let plan_prompt = format!(
+            "Goal: {}\n\nContext & Research Findings:\n{}\n\nBased on the research findings and goal, design a high-precision architectural blueprint, implementation roadmap, module boundaries, data structures, and edge-case handling strategy.",
+            user_goal, research
+        );
+        let plan = self.run_agent_step_with_retry("planner", 2, "Architectural Blueprint & Plan", &plan_prompt).await?;
+        self.blackboard.set("plan", &plan).await;
+
+        // Step 3: Core engineering implementation
         let coder_prompt = format!(
-            "Goal: {}\n\nArchitectural Blueprint:\n{}\n\nContext & Research:\n{}\n\nWrite the complete, high-performance, robust, and clean implementation code with full explanations and tests.",
-            user_goal, plan, research
+            "Goal: {}\n\nResearch Context:\n{}\n\nArchitectural Blueprint:\n{}\n\nWrite the complete, high-performance, robust, and clean implementation code with full explanations, error handling, and unit tests.",
+            user_goal, research, plan
         );
         let code = self.run_agent_step_with_retry("coder", 3, "Core Engineering Implementation", &coder_prompt).await?;
         self.blackboard.set("code", &code).await;
 
+        // Step 4: Security and rigor code audit
         let critic_prompt = format!(
-            "Goal: {}\n\nEngineered Implementation:\n{}\n\nRigorously review the code for correctness, security vulnerabilities, edge cases, algorithmic time/space complexity, and memory safety.",
-            user_goal, code
+            "Goal: {}\n\nArchitectural Plan:\n{}\n\nEngineered Implementation:\n{}\n\nRigorously review the code for correctness, security vulnerabilities, edge cases, algorithmic time/space complexity, and memory safety. Provide actionable fixes.",
+            user_goal, plan, code
         );
         let critique = self.run_agent_step_with_retry("critic", 4, "Security & Performance Review", &critic_prompt).await?;
         self.blackboard.set("critique", &critique).await;
 
+        // Step 5: Final synthesis and delivery
         let synth_prompt = format!(
-            "User Goal: {}\n\nArchitectural Plan:\n{}\n\nImplementation:\n{}\n\nCritic Review & Recommendations:\n{}\n\nSynthesize this into the final, definitive response with all polished artifacts and recommendations.",
-            user_goal, plan, code, critique
+            "User Goal: {}\n\nResearch Findings:\n{}\n\nArchitectural Plan:\n{}\n\nImplementation:\n{}\n\nCritic Review & Recommendations:\n{}\n\nSynthesize this into the final, definitive, production-ready deliverable with all polished artifacts, documentation, and recommendations.",
+            user_goal, research, plan, code, critique
         );
         let final_output = self.run_agent_step_with_retry("synthesizer", 5, "Executive Synthesis & Finalization", &synth_prompt).await?;
 
         Ok(final_output)
     }
 
-    /// Topology 2: Assembly Line (Sequential Pipeline)
+    /// Topology 2: Assembly Line (Sequential Pipeline: Researcher -> Planner -> Engineer -> Critic -> Synthesizer)
     async fn run_assembly_line(&mut self, user_goal: &str) -> Result<String> {
-        let plan = self.run_agent_step_with_retry("planner", 1, "Planning Phase", &format!("Create a step-by-step roadmap for: {}", user_goal)).await?;
-        let research = self.run_agent_step_with_retry("researcher", 2, "Research Phase", &format!("Gather necessary details for:\n{}", plan)).await?;
-        let code = self.run_agent_step_with_retry("coder", 3, "Coding Phase", &format!("Implement the solution based on:\n{}", research)).await?;
-        let critique = self.run_agent_step_with_retry("critic", 4, "Review Phase", &format!("Audit this code:\n{}", code)).await?;
-        let synth = self.run_agent_step_with_retry("synthesizer", 5, "Final Assembly", &format!("Produce final output incorporating critique:\nCode:\n{}\nCritique:\n{}", code, critique)).await?;
+        let research = self.run_agent_step_with_retry("researcher", 1, "Context Scouting Phase", &format!("Explore and gather necessary details and context for: {}", user_goal)).await?;
+        let plan = self.run_agent_step_with_retry("planner", 2, "Architectural Planning Phase", &format!("Create a step-by-step roadmap based on research:\n{}", research)).await?;
+        let code = self.run_agent_step_with_retry("coder", 3, "Engineering Phase", &format!("Implement the solution based on:\nPlan:\n{}\nResearch:\n{}", plan, research)).await?;
+        let critique = self.run_agent_step_with_retry("critic", 4, "Review & Audit Phase", &format!("Audit this code for bugs, edge cases, and safety:\n{}", code)).await?;
+        let synth = self.run_agent_step_with_retry("synthesizer", 5, "Final Assembly Phase", &format!("Produce final output incorporating critique:\nCode:\n{}\nCritique:\n{}", code, critique)).await?;
         Ok(synth)
     }
 
     /// Topology 3: Peer Review & Debate Loop
     async fn run_debate_review(&mut self, user_goal: &str) -> Result<String> {
-        let initial_solution = self.run_agent_step_with_retry("coder", 1, "Initial Engineering Draft", &format!("Draft a complete solution for: {}", user_goal)).await?;
-        let critique = self.run_agent_step_with_retry("critic", 2, "Rigor Review & Stress Test", &format!("Stress test and critique this solution:\n{}", initial_solution)).await?;
-        let refined_solution = self.run_agent_step_with_retry("coder", 3, "Refined Implementation", &format!("Refine your solution by directly addressing each critique point:\nCritique:\n{}", critique)).await?;
-        let final_synth = self.run_agent_step_with_retry("synthesizer", 4, "Final Synthesis", &format!("Synthesize the final peer-reviewed solution:\n{}", refined_solution)).await?;
+        let research = self.run_agent_step_with_retry("researcher", 1, "Context Exploration", &format!("Explore context and constraints for: {}", user_goal)).await?;
+        let initial_solution = self.run_agent_step_with_retry("coder", 2, "Initial Engineering Draft", &format!("Draft a complete solution for: {}\nContext:\n{}", user_goal, research)).await?;
+        let critique = self.run_agent_step_with_retry("critic", 3, "Rigor Review & Stress Test", &format!("Stress test and critique this solution:\n{}", initial_solution)).await?;
+        let refined_solution = self.run_agent_step_with_retry("coder", 4, "Refined Implementation", &format!("Refine your solution by directly addressing each critique point:\nCritique:\n{}", critique)).await?;
+        let final_synth = self.run_agent_step_with_retry("synthesizer", 5, "Final Synthesis", &format!("Synthesize the final peer-reviewed solution:\n{}", refined_solution)).await?;
         Ok(final_synth)
     }
 

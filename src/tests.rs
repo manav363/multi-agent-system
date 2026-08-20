@@ -113,5 +113,38 @@ mod tests {
         let coder = Agent::coder("qwen3:4b");
         assert_eq!(coder.config.role, AgentRole::Coder);
         assert!(coder.config.enabled_tools.contains(&"write_file".to_string()));
+
+        let researcher = Agent::researcher("llama3.2:3b");
+        assert_eq!(researcher.config.role, AgentRole::Researcher);
+        assert!(researcher.config.enabled_tools.contains(&"read_file".to_string()));
+        assert!(researcher.config.enabled_tools.contains(&"bash_command".to_string()));
+    }
+
+    #[test]
+    fn test_orchestrator_multi_model_routing() {
+        use crate::core::orchestrator::{Orchestrator, TopologyMode};
+        use crate::llm::OllamaProvider;
+        use crate::tools::ToolRegistry;
+        use std::sync::Arc;
+
+        let provider = Arc::new(OllamaProvider::new("http://127.0.0.1:11434"));
+        let tools = ToolRegistry::new();
+        let orchestrator = Orchestrator::with_models(
+            TopologyMode::Hierarchical,
+            provider,
+            "llama3.2:3b", // planner
+            "llama3.2:3b", // researcher
+            "qwen3:4b",    // coder
+            "qwen3:4b",    // critic
+            "llama3.2:3b", // synthesizer
+            tools,
+            None,
+        );
+
+        assert_eq!(orchestrator.agents.get("researcher").unwrap().config.model, "llama3.2:3b");
+        assert_eq!(orchestrator.agents.get("planner").unwrap().config.model, "llama3.2:3b");
+        assert_eq!(orchestrator.agents.get("coder").unwrap().config.model, "qwen3:4b");
+        assert_eq!(orchestrator.agents.get("critic").unwrap().config.model, "qwen3:4b");
+        assert_eq!(orchestrator.agents.get("synthesizer").unwrap().config.model, "llama3.2:3b");
     }
 }

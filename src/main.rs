@@ -28,9 +28,13 @@ struct CliArgs {
     #[arg(long, default_value = "ollama")]
     provider: String,
 
-    /// Default model tag to use (e.g. qwen3:4b, llama3.1, deepseek-r1)
+    /// Default model tag to use for engineer & critic (e.g. qwen3:4b, llama3.1, deepseek-r1)
     #[arg(short, long, default_value = "qwen3:4b")]
     model: String,
+
+    /// Secondary model tag to use for planning, research & synthesis (e.g. llama3.2:3b)
+    #[arg(long)]
+    planner_model: Option<String>,
 
     /// Default multi-agent topology: [hierarchical, pipeline, debate, direct]
     #[arg(short, long, default_value = "hierarchical")]
@@ -85,7 +89,7 @@ async fn main() -> Result<()> {
 
     // 3. Headless / CLI Benchmark Mode
     if let Some(prompt) = args.prompt {
-        run_headless_mode(provider, tools, &args.model, topology_mode, &prompt).await?;
+        run_headless_mode(provider, tools, &args.model, args.planner_model.as_deref(), topology_mode, &prompt).await?;
         return Ok(());
     }
 
@@ -110,19 +114,33 @@ async fn run_app(
 async fn run_headless_mode(
     provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
-    model: &str,
+    coder_model: &str,
+    planner_model_opt: Option<&str>,
     topology: TopologyMode,
     prompt: &str,
 ) -> Result<()> {
+    let planner_model = planner_model_opt.unwrap_or(coder_model);
+
     println!("⚡ AGENT ORCHESTRA (Headless Mode)");
-    println!("├─ Provider: {}", provider.name());
-    println!("├─ Endpoint: {}", provider.endpoint());
-    println!("├─ Model:    {}", model);
-    println!("├─ Topology: {}", topology.name());
-    println!("└─ Goal:     {}\n", prompt);
+    println!("├─ Provider:      {}", provider.name());
+    println!("├─ Endpoint:      {}", provider.endpoint());
+    println!("├─ Engineer/Crit: {}", coder_model);
+    println!("├─ Plan/Res/Syn:  {}", planner_model);
+    println!("├─ Topology:      {}", topology.name());
+    println!("└─ Goal:          {}\n", prompt);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut orchestrator = core::Orchestrator::new(topology, provider, model, tools, Some(tx));
+    let mut orchestrator = core::Orchestrator::with_models(
+        topology,
+        provider,
+        planner_model,
+        planner_model,
+        coder_model,
+        coder_model,
+        planner_model,
+        tools,
+        Some(tx),
+    );
 
     let prompt_owned = prompt.to_string();
     let orchestrator_task = tokio::spawn(async move {

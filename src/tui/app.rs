@@ -117,10 +117,29 @@ impl App {
             available_models[0].clone()
         };
 
-        let orchestrator = Orchestrator::new(
+        // Determine optimal role models:
+        // Use llama3.2/llama or a secondary model for planner, researcher, synthesizer
+        // Use qwen3 or main model for coder, critic
+        let (planning_model, coding_model) = {
+            let llama_candidate = available_models.iter().find(|m| m.contains("llama") || m.contains("3.2"));
+            let qwen_candidate = available_models.iter().find(|m| m.contains("qwen"));
+
+            match (llama_candidate, qwen_candidate) {
+                (Some(llama), Some(qwen)) => (llama.clone(), qwen.clone()),
+                (Some(llama), None) => (llama.clone(), selected_model.clone()),
+                (None, Some(qwen)) => (selected_model.clone(), qwen.clone()),
+                (None, None) => (selected_model.clone(), selected_model.clone()),
+            }
+        };
+
+        let orchestrator = Orchestrator::with_models(
             TopologyMode::Hierarchical,
             provider.clone(),
-            &selected_model,
+            &planning_model,  // planner
+            &planning_model,  // researcher
+            &coding_model,    // coder
+            &coding_model,    // critic
+            &planning_model,  // synthesizer
             tools,
             Some(event_tx.clone()),
         );
@@ -152,7 +171,7 @@ impl App {
     }
 
     pub fn ordered_agents(&self) -> Vec<&Agent> {
-        let order = ["planner", "researcher", "coder", "critic", "synthesizer"];
+        let order = ["researcher", "planner", "coder", "critic", "synthesizer"];
         let mut list = Vec::new();
         for id in order {
             if let Some(agent) = self.orchestrator.agents.get(id) {
@@ -519,8 +538,19 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(chosen_model) = self.available_models.get(self.selected_model_idx) {
-                        self.orchestrator.set_model_for_all(chosen_model);
-                        self.system_logs.push(format!("Active model switched to: {}", chosen_model));
+                        if self.active_tab == ActiveTab::AgentsConfig {
+                            let agents = self.ordered_agents();
+                            if let Some(agent) = agents.get(self.selected_agent_idx) {
+                                let agent_id = agent.config.id.clone();
+                                if let Some(target) = self.orchestrator.agents.get_mut(&agent_id) {
+                                    target.config.model = chosen_model.clone();
+                                    self.system_logs.push(format!("Model for {} switched to: {}", target.config.name, chosen_model));
+                                }
+                            }
+                        } else {
+                            self.orchestrator.set_model_for_all(chosen_model);
+                            self.system_logs.push(format!("Active model for all agents switched to: {}", chosen_model));
+                        }
                     }
                     self.input_mode = InputMode::Normal;
                 }
