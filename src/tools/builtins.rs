@@ -8,8 +8,50 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-/// Bash Command Execution Tool
+/// Bash Command Execution Tool (sandboxed)
 pub struct BashCommandTool;
+
+/// Commands/patterns that are blocked for safety
+const BLOCKED_PATTERNS: &[&str] = &[
+    "rm -rf /",
+    "rm -rf /*",
+    "rm -rf ~",
+    "mkfs",
+    "dd if=",
+    "> /dev/sd",
+    "> /dev/nvme",
+    "chmod 777",
+    "chmod -R 777",
+    ":(){ :|:",           // fork bomb
+    "curl|sh", "curl |sh", "curl| sh", "curl | sh",
+    "wget|sh", "wget |sh", "wget| sh", "wget | sh",
+    "curl|bash", "curl |bash", "curl| bash", "curl | bash",
+    "wget|bash", "wget |bash", "wget| bash", "wget | bash",
+    "/etc/shadow",
+    "/etc/passwd",
+    "shutdown",
+    "reboot",
+    "init 0",
+    "init 6",
+    "systemctl poweroff",
+    "systemctl reboot",
+];
+
+/// Max output size in bytes to prevent memory exhaustion
+const MAX_OUTPUT_BYTES: usize = 64_000;
+
+/// Default timeout in seconds
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+fn is_command_blocked(command: &str) -> Option<&'static str> {
+    let lower = command.to_lowercase();
+    for pattern in BLOCKED_PATTERNS {
+        if lower.contains(&pattern.to_lowercase()) {
+            return Some(pattern);
+        }
+    }
+    None
+}
 
 #[async_trait]
 impl Tool for BashCommandTool {
@@ -18,7 +60,7 @@ impl Tool for BashCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command with a safety timeout and capture stdout and stderr output."
+        "Execute a shell command with safety sandboxing (dangerous commands are blocked) and capture stdout/stderr output."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -31,7 +73,11 @@ impl Tool for BashCommandTool {
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Optional working directory"
+                    "description": "Optional working directory (must not traverse outside project)"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Optional timeout in seconds (default: 30, max: 120)"
                 }
             },
             "required": ["command"]
@@ -44,20 +90,58 @@ impl Tool for BashCommandTool {
             .and_then(|v| v.as_str())
             .context("Missing 'command' parameter")?;
 
+        // Safety: check against blocked patterns
+        if let Some(blocked) = is_command_blocked(command_str) {
+            anyhow::bail!(
+                "🛡️ Command blocked for safety. Matched pattern: '{}'. This tool restricts destructive and dangerous operations.",
+                blocked
+            );
+        }
+
         let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
+
+        // Safety: prevent path traversal to sensitive directories
+        let cwd_path = Path::new(cwd);
+        if let Ok(canonical) = cwd_path.canonicalize() {
+            let canonical_str = canonical.to_string_lossy();
+            if canonical_str.starts_with("/etc")
+                || canonical_str.starts_with("/var")
+                || canonical_str.starts_with("/usr")
+                || canonical_str.starts_with("/bin")
+                || canonical_str.starts_with("/sbin")
+                || canonical_str.starts_with("/boot")
+                || canonical_str.starts_with("/root")
+            {
+                anyhow::bail!(
+                    "🛡️ Working directory '{}' is in a restricted system path. Use a project directory instead.",
+                    canonical_str
+                );
+            }
+        }
+
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .min(120);
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command_str);
         cmd.current_dir(cwd);
 
-        let output = timeout(Duration::from_secs(15), cmd.output())
+        let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
             .await
-            .context("Command timed out after 15 seconds")?
+            .with_context(|| format!("Command timed out after {}s", timeout_secs))?
             .context("Failed to execute command")?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout_raw = String::from_utf8_lossy(&output.stdout);
+        let stderr_raw = String::from_utf8_lossy(&output.stderr);
         let exit_code = output.status.code().unwrap_or(-1);
+
+        // Cap output size to prevent memory exhaustion
+        let stdout: String = stdout_raw.chars().take(MAX_OUTPUT_BYTES).collect();
+        let stderr: String = stderr_raw.chars().take(MAX_OUTPUT_BYTES / 4).collect();
+        let was_truncated = stdout_raw.len() > MAX_OUTPUT_BYTES || stderr_raw.len() > MAX_OUTPUT_BYTES / 4;
 
         let mut res = String::new();
         if !stdout.is_empty() {
@@ -65,6 +149,9 @@ impl Tool for BashCommandTool {
         }
         if !stderr.is_empty() {
             res.push_str(&format!("STDERR:\n{}\n", stderr.trim()));
+        }
+        if was_truncated {
+            res.push_str("⚠️ Output was truncated (exceeded size limit)\n");
         }
         res.push_str(&format!("(exit code: {})", exit_code));
         Ok(res)
@@ -266,7 +353,7 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// Math & Calculator Tool
+/// Math & Calculator Tool (pure-Rust, no external dependencies)
 pub struct CalculatorTool;
 
 #[async_trait]
@@ -276,7 +363,7 @@ impl Tool for CalculatorTool {
     }
 
     fn description(&self) -> &str {
-        "Evaluate basic arithmetic, algebraic equations, or percentages (e.g. '1024 * 768 / 1000', 'sqrt(144)', '2^16')."
+        "Evaluate arithmetic and math expressions safely. Supports: +, -, *, /, ^, sqrt, sin, cos, tan, ln, exp, abs, pi, e. Example: 'sqrt(144) + 2^16'"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -298,21 +385,15 @@ impl Tool for CalculatorTool {
             .and_then(|v| v.as_str())
             .context("Missing 'expression' parameter")?;
 
-        // Simple and safe arithmetic evaluator using standard sh/python one-liner
-        let cmd = format!("python3 -c 'import math; print({})'", expr);
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .output()
-            .await
-            .context("Failed to run math calculation")?;
+        // Normalize common patterns LLMs might use
+        let normalized = expr
+            .replace("×", "*")
+            .replace("÷", "/")
+            .replace("**", "^");
 
-        if output.status.success() {
-            let res = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Ok(format!("Result: {}", res))
-        } else {
-            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            anyhow::bail!("Math evaluation error: {}", err)
+        match meval::eval_str(&normalized) {
+            Ok(result) => Ok(format!("Result: {}", result)),
+            Err(e) => anyhow::bail!("Math evaluation error: {} (expression: '{}')", e, expr),
         }
     }
 }

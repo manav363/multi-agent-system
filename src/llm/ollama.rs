@@ -1,5 +1,5 @@
 use crate::core::memory::ChatMessage;
-use crate::llm::provider::{ChunkStream, LlmProvider, LlmStreamChunk};
+use crate::llm::provider::{ChunkStream, LlmProvider, LlmStreamChunk, ToolCall};
 use crate::tools::tool::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -27,6 +27,41 @@ impl OllamaProvider {
 
         Self { endpoint, client }
     }
+
+    /// Build native Ollama tool schema from our Tool trait objects
+    fn build_native_tool_schemas(tools: &[Arc<dyn Tool>]) -> Vec<serde_json::Value> {
+        tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name(),
+                        "description": tool.description(),
+                        "parameters": tool.parameters_schema()
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Build text-based tool instructions for fallback (models without native tool support)
+    fn build_text_tool_instructions(tools: &[Arc<dyn Tool>]) -> String {
+        let mut desc = String::from(
+            "\n\nYou have access to the following tools. If you need to call a tool, output a single JSON block formatted strictly as:\n```json\n{\"tool\": \"tool_name\", \"arguments\": { ... }}\n```\nAvailable Tools:\n",
+        );
+        for tool in tools {
+            let schema_str =
+                serde_json::to_string_pretty(&tool.parameters_schema()).unwrap_or_default();
+            desc.push_str(&format!(
+                "- **{}**: {}\nParameters:\n{}\n\n",
+                tool.name(),
+                tool.description(),
+                schema_str
+            ));
+        }
+        desc
+    }
 }
 
 #[derive(Deserialize)]
@@ -39,15 +74,27 @@ struct OllamaModelItem {
     name: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
+struct OllamaToolCall {
+    function: Option<OllamaToolCallFunction>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OllamaToolCallFunction {
+    name: Option<String>,
+    arguments: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Debug)]
 struct OllamaStreamMessage {
     #[allow(dead_code)]
     role: Option<String>,
     content: Option<String>,
     thinking: Option<String>,
+    tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct OllamaStreamResponse {
     message: Option<OllamaStreamMessage>,
     done: bool,
@@ -105,19 +152,17 @@ impl LlmProvider for OllamaProvider {
     ) -> Result<ChunkStream> {
         let url = format!("{}/api/chat", self.endpoint);
 
-        // Convert messages & tool schema definitions
+        // Format messages for Ollama API
         let mut formatted_messages = Vec::new();
 
-        // If tools are present, augment system prompt with instructions on how to use them
-        if !tools.is_empty() {
-            let mut tools_desc = String::from(
-                "\n\nYou have access to the following tools. If you need to call a tool, output a single JSON block formatted strictly as:\n```json\n{\"tool\": \"tool_name\", \"arguments\": { ... }}\n```\nAvailable Tools:\n",
-            );
-            for tool in tools {
-                let schema_str = serde_json::to_string_pretty(&tool.parameters_schema()).unwrap_or_default();
-                tools_desc.push_str(&format!("- **{}**: {}\nParameters:\n{}\n\n", tool.name(), tool.description(), schema_str));
-            }
+        // Determine if we should try native tool calling
+        // Native tool calling: send tools in the API `tools` field
+        // Fallback: inject tool descriptions into system prompt text
+        let use_native_tools = !tools.is_empty();
 
+        if !use_native_tools && !tools.is_empty() {
+            // Fallback: text-based tool instructions
+            let tools_desc = Self::build_text_tool_instructions(tools);
             for msg in messages {
                 if msg.role == crate::core::memory::MessageRole::System {
                     formatted_messages.push(json!({
@@ -140,7 +185,8 @@ impl LlmProvider for OllamaProvider {
             }
         }
 
-        let body = json!({
+        // Build request body
+        let mut body = json!({
             "model": model,
             "messages": formatted_messages,
             "stream": true,
@@ -148,6 +194,12 @@ impl LlmProvider for OllamaProvider {
                 "temperature": temperature
             }
         });
+
+        // Add native tool schemas if using native tool calling
+        if use_native_tools {
+            let tool_schemas = Self::build_native_tool_schemas(tools);
+            body["tools"] = json!(tool_schemas);
+        }
 
         let resp = self
             .client
@@ -184,17 +236,42 @@ impl LlmProvider for OllamaProvider {
                                 continue;
                             }
 
-                            if let Ok(parsed) = serde_json::from_str::<OllamaStreamResponse>(&line) {
-                                let (delta, is_thought) = if let Some(msg) = parsed.message {
-                                    if let Some(thought) = msg.thinking {
+                            if let Ok(parsed) =
+                                serde_json::from_str::<OllamaStreamResponse>(&line)
+                            {
+                                // Extract native tool calls if present
+                                let mut native_tool_calls = Vec::new();
+
+                                let (delta, is_thought) = if let Some(ref msg) = parsed.message {
+                                    // Check for native tool_calls in the message
+                                    if let Some(ref tc_list) = msg.tool_calls {
+                                        for tc in tc_list {
+                                            if let Some(ref func) = tc.function {
+                                                if let Some(ref name) = func.name {
+                                                    let args = func
+                                                        .arguments
+                                                        .clone()
+                                                        .unwrap_or(json!({}));
+                                                    native_tool_calls.push(ToolCall {
+                                                        name: name.clone(),
+                                                        arguments: args,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Process thinking/content as before
+                                    if let Some(ref thought) = msg.thinking {
                                         if !thought.is_empty() {
-                                            (thought, true)
-                                        } else if let Some(c) = msg.content {
-                                            (c, in_thought_block)
+                                            (thought.clone(), true)
+                                        } else if let Some(ref c) = msg.content {
+                                            (c.clone(), in_thought_block)
                                         } else {
                                             (String::new(), false)
                                         }
-                                    } else if let Some(mut content) = msg.content {
+                                    } else if let Some(ref content_raw) = msg.content {
+                                        let mut content = content_raw.clone();
                                         if content.contains("<think>") {
                                             in_thought_block = true;
                                             content = content.replace("<think>", "");
@@ -217,6 +294,7 @@ impl LlmProvider for OllamaProvider {
                                     is_done: parsed.done,
                                     prompt_tokens: parsed.prompt_eval_count,
                                     completion_tokens: parsed.eval_count,
+                                    tool_calls: native_tool_calls,
                                 };
 
                                 if tx.send(Ok(chunk)).await.is_err() {
@@ -226,7 +304,9 @@ impl LlmProvider for OllamaProvider {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow::anyhow!("Ollama stream error: {}", e))).await;
+                        let _ = tx
+                            .send(Err(anyhow::anyhow!("Ollama stream error: {}", e)))
+                            .await;
                         return;
                     }
                 }

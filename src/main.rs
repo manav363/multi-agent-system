@@ -12,6 +12,7 @@ use core::orchestrator::TopologyMode;
 use llm::{LlmProvider, OllamaProvider, OpenAiCompatProvider};
 use std::sync::Arc;
 use tools::{register_builtin_tools, ToolRegistry};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(name = "orchestra")]
@@ -42,11 +43,24 @@ struct CliArgs {
     /// OpenAI API key if using an authenticated local or remote endpoint
     #[arg(long)]
     api_key: Option<String>,
+
+    /// Log level for structured tracing: [trace, debug, info, warn, error]
+    #[arg(long, default_value = "warn")]
+    log_level: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CliArgs::parse();
+
+    // Initialize structured tracing (only to stderr to avoid TUI interference)
+    let filter = EnvFilter::try_new(&args.log_level)
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .init();
 
     // 1. Setup Tool Registry
     let mut tools = ToolRegistry::new();

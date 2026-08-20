@@ -9,9 +9,11 @@ use anyhow::Result;
 use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
@@ -89,6 +91,10 @@ pub struct App {
     pub current_streaming_thought: String,
     pub event_rx: UnboundedReceiver<OrchestratorEvent>,
     pub event_tx: UnboundedSender<OrchestratorEvent>,
+    /// Live snapshot of shared blackboard for UI rendering
+    pub blackboard_snapshot: HashMap<String, String>,
+    /// Cancellation token for the currently running workflow
+    pub workflow_cancel_token: Option<CancellationToken>,
 }
 
 impl App {
@@ -140,6 +146,8 @@ impl App {
             current_streaming_thought: String::new(),
             event_rx,
             event_tx,
+            blackboard_snapshot: HashMap::new(),
+            workflow_cancel_token: None,
         })
     }
 
@@ -292,7 +300,7 @@ impl App {
                     duration_ms: None,
                 });
             }
-            OrchestratorEvent::WorkflowStepFinished { step_index, title, agent_id, duration_ms, .. } => {
+            OrchestratorEvent::WorkflowStepFinished { step_index, title, agent_id, duration_ms, output_preview, .. } => {
                 let agent_name = self.orchestrator.agents.get(&agent_id).map(|a| a.config.name.clone()).unwrap_or_default();
                 let m = self.metrics.agent_metrics.get(&agent_id);
                 let tokens = m.map(|x| x.total_tokens).unwrap_or(0);
@@ -311,6 +319,9 @@ impl App {
                     avg_tps: tps,
                     tool_calls_count: 0,
                 });
+
+                // Update live blackboard snapshot with step output
+                self.blackboard_snapshot.insert(agent_id.clone(), output_preview);
 
                 // Update milestone duration
                 for item in self.transcript_items.iter_mut().rev() {
@@ -335,6 +346,14 @@ impl App {
                     self.system_logs.remove(0);
                 }
             }
+            OrchestratorEvent::WorkflowCancelled { reason, .. } => {
+                self.is_running_workflow = false;
+                self.workflow_cancel_token = None;
+                if let Some(TranscriptItem::AgentOutput { is_streaming, .. }) = self.transcript_items.last_mut() {
+                    *is_streaming = false;
+                }
+                self.system_logs.push(format!("[WARN] Workflow cancelled: {}", reason));
+            }
             _ => {}
         }
     }
@@ -348,6 +367,15 @@ impl App {
         match self.input_mode {
             InputMode::Normal => match key.code {
                 KeyCode::Char('q') => return Ok(true),
+                KeyCode::Esc => {
+                    // Cancel running workflow
+                    if self.is_running_workflow {
+                        if let Some(token) = &self.workflow_cancel_token {
+                            token.cancel();
+                            self.system_logs.push("[INFO] Cancellation requested...".to_string());
+                        }
+                    }
+                }
                 KeyCode::Char('i') | KeyCode::Enter => {
                     self.input_mode = InputMode::EditingPrompt;
                 }
@@ -430,9 +458,25 @@ impl App {
                             }
                         }
 
+                        // Store cancellation token for this workflow
+                        let cancel_token = orchestrator_clone.cancel_token.clone();
+                        self.workflow_cancel_token = Some(cancel_token);
+
+                        let event_tx_clone = self.event_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = orchestrator_clone.execute_goal(&prompt).await {
-                                eprintln!("Workflow execution error: {}", e);
+                            match orchestrator_clone.execute_goal(&prompt).await {
+                                Ok(_) => {},
+                                Err(e) => {
+                                    let msg = format!("{}", e);
+                                    if !msg.contains("cancelled") {
+                                        let _ = event_tx_clone.send(OrchestratorEvent::SystemLog {
+                                            level: "ERROR".to_string(),
+                                            target: "Orchestrator".to_string(),
+                                            message: format!("Workflow error: {}", e),
+                                            timestamp: Utc::now(),
+                                        });
+                                    }
+                                }
                             }
                         });
                     }

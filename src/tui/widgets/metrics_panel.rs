@@ -63,9 +63,10 @@ pub fn render_metrics_dashboard(
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
         .title(Span::styled(" Real-time Token Throughput (tok/s) ", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)));
 
+    let tps_data: Vec<u64> = tracker.tps_history.iter().copied().collect();
     let sparkline = Sparkline::default()
         .block(sparkline_block)
-        .data(&tracker.tps_history)
+        .data(&tps_data)
         .style(Style::default().fg(Color::LightGreen));
 
     f.render_widget(sparkline, top_chunks[1]);

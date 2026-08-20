@@ -206,6 +206,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     is_done: true,
                                     prompt_tokens: None,
                                     completion_tokens: None,
+                                    tool_calls: vec![],
                                 })).await;
                                 return;
                             }
@@ -228,6 +229,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                             is_done,
                                             prompt_tokens: None,
                                             completion_tokens: None,
+                                            tool_calls: vec![],
                                         };
 
                                         if tx.send(Ok(chunk)).await.is_err() {

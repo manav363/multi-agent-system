@@ -96,4 +96,8 @@ pub enum OrchestratorEvent {
         message: String,
         timestamp: DateTime<Utc>,
     },
+    WorkflowCancelled {
+        reason: String,
+        timestamp: DateTime<Utc>,
+    },
 }

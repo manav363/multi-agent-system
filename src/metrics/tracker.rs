@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,7 +102,7 @@ pub struct MetricsTracker {
     pub total_workflow_tokens: usize,
     pub agent_metrics: HashMap<String, AgentLiveMetrics>,
     pub waterfall_spans: Vec<WaterfallSpan>,
-    pub tps_history: Vec<u64>,
+    pub tps_history: VecDeque<u64>,
 }
 
 impl Default for MetricsTracker {
@@ -119,7 +119,7 @@ impl MetricsTracker {
             total_workflow_tokens: 0,
             agent_metrics: HashMap::new(),
             waterfall_spans: Vec::new(),
-            tps_history: Vec::new(),
+            tps_history: VecDeque::new(),
         }
     }
 
@@ -149,9 +149,9 @@ impl MetricsTracker {
         agent.record_token();
 
         let current_tps = agent.current_tps.round() as u64;
-        self.tps_history.push(current_tps);
+        self.tps_history.push_back(current_tps);
         if self.tps_history.len() > 60 {
-            self.tps_history.remove(0);
+            self.tps_history.pop_front();
         }
     }
 

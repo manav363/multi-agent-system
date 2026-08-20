@@ -213,40 +213,60 @@ fn render_blackboard_and_logs_tab(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
-    // Left: Blackboard artifacts
+    // Left: Blackboard artifacts (live data)
     let blackboard_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
-        .title(Span::styled(" Shared Memory & Blackboard Artifacts ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(" Shared Memory & Blackboard (Live) ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)));
 
-    let blackboard_lines = vec![
+    let mut blackboard_lines = vec![
         Line::from(vec![
-            Span::styled("  Active inter-agent context memory slots:", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Inter-agent shared context memory:", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  • ", Style::default().fg(Color::Cyan)),
-            Span::styled("plan: ", Style::default().fg(Color::Yellow)),
-            Span::styled("Decomposed tasks & architectural blueprint", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  • ", Style::default().fg(Color::Cyan)),
-            Span::styled("research: ", Style::default().fg(Color::Yellow)),
-            Span::styled("Gathered file context & tool outputs", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  • ", Style::default().fg(Color::Cyan)),
-            Span::styled("code: ", Style::default().fg(Color::Yellow)),
-            Span::styled("Engineered algorithms & implementations", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  • ", Style::default().fg(Color::Cyan)),
-            Span::styled("critique: ", Style::default().fg(Color::Yellow)),
-            Span::styled("Security audit, edge cases, complexity review", Style::default().fg(Color::Gray)),
-        ]),
     ];
 
-    f.render_widget(Paragraph::new(blackboard_lines).block(blackboard_block), chunks[0]);
+    if app.blackboard_snapshot.is_empty() {
+        blackboard_lines.push(Line::from(vec![
+            Span::styled("  (empty) ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Run a workflow to populate blackboard.", Style::default().fg(Color::Rgb(120, 120, 130))),
+        ]));
+    } else {
+        // Sort keys for consistent display
+        let mut keys: Vec<&String> = app.blackboard_snapshot.keys().collect();
+        keys.sort();
+
+        for key in keys {
+            if let Some(value) = app.blackboard_snapshot.get(key) {
+                let preview: String = value
+                    .chars()
+                    .take(80)
+                    .map(|c| if c == '\n' { ' ' } else { c })
+                    .collect();
+                let suffix = if value.len() > 80 { "..." } else { "" };
+
+                blackboard_lines.push(Line::from(vec![
+                    Span::styled("  ● ", Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("{}: ", key), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("({} bytes)", value.len()),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                blackboard_lines.push(Line::from(vec![
+                    Span::styled(format!("    {}{}", preview, suffix), Style::default().fg(Color::Rgb(180, 180, 190))),
+                ]));
+                blackboard_lines.push(Line::from(""));
+            }
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(blackboard_lines)
+            .block(blackboard_block)
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
 
     // Right: System logs
     let logs_block = Block::default()

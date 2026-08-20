@@ -24,6 +24,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
 unicode-width = "0.2"
 regex = "1.10"
+meval = "0.2"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [profile.release]
 opt-level = 3

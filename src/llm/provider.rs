@@ -9,12 +9,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmStreamChunk {
     pub delta: String,
     pub is_thought: bool,
     pub is_done: bool,
     pub prompt_tokens: Option<usize>,
     pub completion_tokens: Option<usize>,
+    /// Structured tool calls from native provider protocol (Ollama/OpenAI function_calling)
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Clone, Default)]
