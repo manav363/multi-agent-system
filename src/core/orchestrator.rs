@@ -289,8 +289,8 @@ impl Orchestrator {
         let mut current_prompt = prompt.to_string();
         let mut full_agent_response = String::new();
 
-        // Max tool iterations per agent step to prevent infinite loops
-        for _iteration in 0..4 {
+        // Max tool iterations per agent step — only Researcher should use tools (2 calls max)
+        for _iteration in 0..2 {
             self.check_cancelled()?;
 
             let (model, temp, max_tokens, enabled_tools) = {
@@ -411,10 +411,18 @@ impl Orchestrator {
                     agent.add_tool_result(&result_str, &tool_name);
                 }
 
-                current_prompt = format!(
-                    "Tool '{}' output:\n{}\n\nContinue with your task and provide the final response or call the next tool if required.",
-                    tool_name, result_str
-                );
+                // On tool error, stop calling tools and proceed with what we have
+                if is_err {
+                    current_prompt = format!(
+                        "Tool '{}' failed: {}\n\nProceed with your task using the context you already have. Write your final response now.",
+                        tool_name, result_str
+                    );
+                } else {
+                    current_prompt = format!(
+                        "Tool '{}' returned:\n{}\n\nUse this result to write your final response now. Do NOT call more tools unless absolutely necessary.",
+                        tool_name, result_str
+                    );
+                }
             } else {
                 // No tool called, step is complete
                 break;
@@ -476,7 +484,8 @@ impl Orchestrator {
         }
 
         // 2. Check for markdown codeblock: ```json {"tool"/"name": "...", "arguments": {...}} ```
-        if let Ok(json_codeblock_re) = Regex::new(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```") {
+        // IMPORTANT: Only match explicit ```json blocks to avoid matching ```rust/```python code examples
+        if let Ok(json_codeblock_re) = Regex::new(r"```json\s*(\{[\s\S]*?\})\s*```") {
             for cap in json_codeblock_re.captures_iter(text) {
                 if let Some(matched) = cap.get(1) {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(matched.as_str()) {

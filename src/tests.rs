@@ -112,7 +112,8 @@ mod tests {
 
         let coder = Agent::coder("qwen3:4b");
         assert_eq!(coder.config.role, AgentRole::Coder);
-        assert!(coder.config.enabled_tools.contains(&"write_file".to_string()));
+        // Engineer has NO tools — writes code directly from context (prevents tool call loops)
+        assert!(coder.config.enabled_tools.is_empty());
 
         let researcher = Agent::researcher("llama3.2:3b");
         assert_eq!(researcher.config.role, AgentRole::Researcher);
