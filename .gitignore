@@ -1,0 +1,4 @@
+/target
+/scratch
+*.log
+.DS_Store
