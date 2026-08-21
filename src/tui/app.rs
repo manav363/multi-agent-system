@@ -1,19 +1,24 @@
 use crate::core::agent::{Agent, AgentRole};
 use crate::core::events::{AgentStatus, OrchestratorEvent};
-use crate::core::orchestrator::{Orchestrator, TopologyMode};
+use crate::core::memory::ChatMessage;
+use crate::core::orchestrator::Orchestrator;
+use crate::core::roster::RosterFile;
+use crate::core::session::{Session, StepRecord};
 use crate::core::text::byte_offset;
+use crate::core::topology::TopologyMode;
 use crate::llm::provider::LlmProvider;
 use crate::metrics::tracker::{MetricsTracker, WaterfallSpan};
 use crate::tools::tool::ToolRegistry;
 use crate::tui::widgets::transcript::{NoticeLevel, TranscriptItem, ViewportInfo};
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use ratatui::DefaultTerminal;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,6 +83,8 @@ pub enum InputMode {
     ModelSelectModal,
     TopologySelectModal,
     HelpModal,
+    /// Editing the selected agent's system prompt.
+    PromptEditor,
 }
 
 pub struct App {
@@ -112,78 +119,98 @@ pub struct App {
     pub pending_tool_calls: HashMap<String, usize>,
     /// Written during render so scrolling can be clamped to real content.
     pub transcript_viewport: Cell<ViewportInfo>,
+    /// Agent ids in roster order.
+    pub agent_order: Vec<String>,
+    pub context_tokens: usize,
+    pub session_dir: PathBuf,
+    pub save_sessions: bool,
+    pub workspace: PathBuf,
+    /// Where an edited roster is written back to.
+    pub roster_path: PathBuf,
+    /// Working copy of the prompt being edited.
+    pub prompt_editor: String,
+    /// Cursor position in `prompt_editor`, counted in characters.
+    pub prompt_editor_cursor: usize,
+    /// Goal of the run in flight, kept so a session can be written when it ends.
+    active_goal: Option<String>,
+    goal_started_at: Option<DateTime<Utc>>,
+    /// The worker orchestrator returns its agents here when a goal finishes, so
+    /// the next goal continues the same conversation instead of starting cold.
+    history_tx: UnboundedSender<Vec<(String, Vec<ChatMessage>)>>,
+    history_rx: UnboundedReceiver<Vec<(String, Vec<ChatMessage>)>>,
+}
+
+/// Everything the app needs from the CLI, grouped so `App::new` takes one
+/// argument instead of eight.
+pub struct AppConfig {
+    pub provider: Arc<dyn LlmProvider>,
+    pub tools: ToolRegistry,
+    pub roster: Vec<Agent>,
+    pub default_model: String,
+    pub context_tokens: usize,
+    pub session_dir: PathBuf,
+    pub save_sessions: bool,
+    pub workspace: PathBuf,
+    pub roster_path: PathBuf,
 }
 
 impl App {
-    pub async fn new(
-        provider: Arc<dyn LlmProvider>,
-        tools: ToolRegistry,
-        default_model: &str,
-    ) -> Result<Self> {
+    pub async fn new(config: AppConfig) -> Result<Self> {
         let (event_tx, event_rx) = unbounded_channel();
+        let (history_tx, history_rx) = unbounded_channel();
 
-        let provider_online = provider.is_available().await;
+        let provider_online = config.provider.is_available().await;
 
-        // Discover installed models
-        let mut available_models = provider.list_models().await.unwrap_or_default();
+        let mut available_models = config.provider.list_models().await.unwrap_or_default();
         if available_models.is_empty() {
-            available_models.push(default_model.to_string());
+            available_models.push(config.default_model.clone());
         }
 
-        let selected_model = if available_models.contains(&default_model.to_string()) {
-            default_model.to_string()
+        let selected_model = if available_models.contains(&config.default_model) {
+            config.default_model.clone()
         } else {
             available_models[0].clone()
         };
-
-        // Determine optimal role models:
-        // Use llama3.2/llama or a secondary model for planner, researcher, synthesizer
-        // Use qwen3 or main model for coder, critic
-        let (planning_model, coding_model) = {
-            let llama_candidate = available_models
-                .iter()
-                .find(|m| m.contains("llama") || m.contains("3.2"));
-            let qwen_candidate = available_models.iter().find(|m| m.contains("qwen"));
-
-            match (llama_candidate, qwen_candidate) {
-                (Some(llama), Some(qwen)) => (llama.clone(), qwen.clone()),
-                (Some(llama), None) => (llama.clone(), selected_model.clone()),
-                (None, Some(qwen)) => (selected_model.clone(), qwen.clone()),
-                (None, None) => (selected_model.clone(), selected_model.clone()),
-            }
-        };
-
-        let orchestrator = Orchestrator::with_models(
-            TopologyMode::Hierarchical,
-            provider.clone(),
-            &planning_model, // planner
-            &planning_model, // researcher
-            &coding_model,   // coder
-            &coding_model,   // critic
-            &planning_model, // synthesizer
-            tools,
-            Some(event_tx.clone()),
-        );
-
         let selected_model_idx = available_models
             .iter()
             .position(|m| m == &selected_model)
             .unwrap_or(0);
+
+        let agent_order: Vec<String> = config.roster.iter().map(|a| a.config.id.clone()).collect();
+
+        let orchestrator = Orchestrator::from_agents(
+            TopologyMode::Hierarchical,
+            config.provider.clone(),
+            config.roster,
+            config.tools,
+            Some(event_tx.clone()),
+        )
+        .with_context_tokens(config.context_tokens);
 
         let mut transcript_items = Vec::new();
         let mut system_logs = Vec::new();
         if !provider_online {
             let msg = format!(
                 "{} at {} is not responding. Start it before submitting a goal.",
-                provider.name(),
-                provider.endpoint()
+                config.provider.name(),
+                config.provider.endpoint()
             );
-            system_logs.push(format!("[ERROR] Provider: {}", msg));
+            system_logs.push(format!("[ERROR] Provider: {msg}"));
             transcript_items.push(TranscriptItem::Notice {
                 level: NoticeLevel::Error,
                 text: msg,
             });
         }
+        system_logs.push(format!(
+            "[INFO] Setup: context {} tokens · workspace {} · sessions {}",
+            config.context_tokens,
+            config.workspace.display(),
+            if config.save_sessions {
+                config.session_dir.display().to_string()
+            } else {
+                "disabled".to_string()
+            }
+        ));
 
         Ok(Self {
             active_tab: ActiveTab::Studio,
@@ -191,6 +218,7 @@ impl App {
             prompt_input: String::new(),
             input_cursor_pos: 0,
             orchestrator,
+            agent_order,
             available_models,
             selected_model_idx,
             selected_topology_idx: 0,
@@ -211,18 +239,26 @@ impl App {
             step_progress: None,
             pending_tool_calls: HashMap::new(),
             transcript_viewport: Cell::new(ViewportInfo::default()),
+            context_tokens: config.context_tokens,
+            session_dir: config.session_dir,
+            save_sessions: config.save_sessions,
+            workspace: config.workspace,
+            roster_path: config.roster_path,
+            prompt_editor: String::new(),
+            prompt_editor_cursor: 0,
+            active_goal: None,
+            goal_started_at: None,
+            history_tx,
+            history_rx,
         })
     }
 
+    /// Agents in roster order, which the configured roster defines.
     pub fn ordered_agents(&self) -> Vec<&Agent> {
-        let order = ["researcher", "planner", "coder", "critic", "synthesizer"];
-        let mut list = Vec::new();
-        for id in order {
-            if let Some(agent) = self.orchestrator.agents.get(id) {
-                list.push(agent);
-            }
-        }
-        list
+        self.agent_order
+            .iter()
+            .filter_map(|id| self.orchestrator.agents.get(id))
+            .collect()
     }
 
     pub fn topologies() -> &'static [TopologyMode] {
@@ -242,6 +278,13 @@ impl App {
             // renders state that is already one tick stale.
             while let Ok(event) = self.event_rx.try_recv() {
                 self.handle_orchestrator_event(event);
+            }
+            while let Ok(histories) = self.history_rx.try_recv() {
+                for (id, history) in histories {
+                    if let Some(agent) = self.orchestrator.agents.get_mut(&id) {
+                        agent.history = history;
+                    }
+                }
             }
 
             terminal.draw(|f| {
@@ -601,6 +644,139 @@ impl App {
         }
     }
 
+    fn editor_insert(&mut self, c: char) {
+        let at = byte_offset(&self.prompt_editor, self.prompt_editor_cursor);
+        self.prompt_editor.insert(at, c);
+        self.prompt_editor_cursor += 1;
+    }
+
+    /// Load the selected agent's system prompt into the editor.
+    fn open_prompt_editor(&mut self) {
+        let Some(agent) = self.ordered_agents().get(self.selected_agent_idx).copied() else {
+            return;
+        };
+        self.prompt_editor = agent.config.system_prompt.clone();
+        self.prompt_editor_cursor = self.prompt_editor.chars().count();
+        self.input_mode = InputMode::PromptEditor;
+    }
+
+    /// Apply the edited prompt to the agent and persist the whole roster.
+    ///
+    /// The agent's history starts with its system message, so that has to be
+    /// rewritten too — otherwise the edit shows in the roster pane but the
+    /// model keeps receiving the old instructions.
+    async fn save_prompt_editor(&mut self) {
+        let Some(agent_id) = self
+            .ordered_agents()
+            .get(self.selected_agent_idx)
+            .map(|a| a.config.id.clone())
+        else {
+            return;
+        };
+
+        let new_prompt = self.prompt_editor.clone();
+        if let Some(agent) = self.orchestrator.agents.get_mut(&agent_id) {
+            agent.config.system_prompt = new_prompt.clone();
+            match agent.history.first_mut() {
+                Some(first) if first.role == crate::core::memory::MessageRole::System => {
+                    first.content = new_prompt;
+                }
+                _ => agent.history.insert(0, ChatMessage::system(new_prompt)),
+            }
+        }
+
+        let roster = RosterFile::from_agents(&self.ordered_agents_owned());
+        let message = match roster.save(&self.roster_path).await {
+            Ok(()) => format!(
+                "Prompt for {agent_id} saved to {}",
+                self.roster_path.display()
+            ),
+            Err(e) => format!("Could not save roster: {e}"),
+        };
+
+        let failed = message.starts_with("Could not");
+        self.system_logs.push(format!(
+            "[{}] Roster: {message}",
+            if failed { "ERROR" } else { "INFO" }
+        ));
+        self.push_transcript(TranscriptItem::Notice {
+            level: if failed {
+                NoticeLevel::Error
+            } else {
+                NoticeLevel::Success
+            },
+            text: message,
+        });
+
+        self.input_mode = InputMode::Normal;
+        self.prompt_editor.clear();
+    }
+
+    /// Roster order, as owned agents — for serialising.
+    fn ordered_agents_owned(&self) -> Vec<Agent> {
+        self.ordered_agents().into_iter().cloned().collect()
+    }
+
+    /// Write the current run to a Markdown file next to the session records.
+    fn export_transcript(&mut self) {
+        let Some(goal) = self.active_goal.clone() else {
+            self.system_logs
+                .push("[WARN] Export: nothing to export yet — run a goal first.".to_string());
+            return;
+        };
+
+        let session = Session {
+            started_at: self.goal_started_at.unwrap_or_else(Utc::now),
+            goal,
+            topology: self.orchestrator.topology.name().to_string(),
+            provider: self.orchestrator.provider.name().to_string(),
+            models: self
+                .ordered_agents()
+                .iter()
+                .map(|a| (a.config.id.clone(), a.config.model.clone()))
+                .collect(),
+            context_tokens: self.context_tokens,
+            duration_ms: self.metrics.global_elapsed_ms(),
+            total_tokens: self.metrics.total_workflow_tokens,
+            steps: self
+                .blackboard_snapshot
+                .iter()
+                .filter(|(k, _)| k.as_str() != "user_goal")
+                .map(|(k, v)| StepRecord {
+                    step_id: k.clone(),
+                    output: v.clone(),
+                })
+                .collect(),
+            final_output: String::new(),
+        };
+
+        let path = self
+            .session_dir
+            .join(session.file_name().replace(".json", ".md"));
+        let body = session.to_markdown();
+
+        // Blocking write: it is a few hundred kilobytes at most, on a keypress,
+        // and doing it inline keeps the confirmation in the same frame.
+        let message = match std::fs::create_dir_all(&self.session_dir)
+            .and_then(|_| std::fs::write(&path, body))
+        {
+            Ok(()) => format!("[INFO] Export: wrote {}", path.display()),
+            Err(e) => format!("[ERROR] Export: {e}"),
+        };
+        self.system_logs.push(message.clone());
+        self.push_transcript(TranscriptItem::Notice {
+            level: if message.contains("ERROR") {
+                NoticeLevel::Error
+            } else {
+                NoticeLevel::Success
+            },
+            text: message
+                .trim_start_matches("[INFO] ")
+                .trim_start_matches("[ERROR] ")
+                .to_string(),
+        });
+    }
+
     /// Delete the word to the left of the cursor (Ctrl+W).
     fn delete_word_before_cursor(&mut self) {
         let chars: Vec<char> = self.prompt_input.chars().collect();
@@ -669,6 +845,10 @@ impl App {
                 KeyCode::Char('?') | KeyCode::Char('h') => {
                     self.input_mode = InputMode::HelpModal;
                 }
+                KeyCode::Char('s') => self.export_transcript(),
+                KeyCode::Char('e') if self.active_tab == ActiveTab::AgentsConfig => {
+                    self.open_prompt_editor();
+                }
                 KeyCode::Char('c') => {
                     self.transcript_items.clear();
                     self.pending_tool_calls.clear();
@@ -717,51 +897,112 @@ impl App {
                         self.metrics.start_workflow();
                         self.pending_tool_calls.clear();
                         self.is_running_workflow = true;
+                        self.active_goal = Some(prompt.clone());
+                        self.goal_started_at = Some(Utc::now());
 
-                        // Spawn workflow task
-                        let mut orchestrator_clone = Orchestrator::new(
+                        // The workflow runs on its own orchestrator so the UI
+                        // stays responsive; it shares this one's blackboard and
+                        // roster so both observe the same state. Agents are
+                        // cloned WITH their history, so a follow-up goal
+                        // continues the conversation rather than starting cold.
+                        let carry_over = self.context_tokens / 4;
+                        let roster: Vec<Agent> = self
+                            .ordered_agents()
+                            .into_iter()
+                            .cloned()
+                            .map(|mut a| {
+                                a.trim_history(carry_over);
+                                a
+                            })
+                            .collect();
+
+                        let mut worker = Orchestrator::from_agents(
                             self.orchestrator.topology,
                             self.orchestrator.provider.clone(),
-                            &self.available_models[self.selected_model_idx],
+                            roster,
                             self.orchestrator.tools.clone(),
                             Some(self.event_tx.clone()),
                         )
-                        .with_blackboard(self.orchestrator.blackboard.clone());
+                        .with_blackboard(self.orchestrator.blackboard.clone())
+                        .with_context_tokens(self.context_tokens);
 
-                        // Copy per-agent model configurations
-                        for (id, agent) in &self.orchestrator.agents {
-                            if let Some(target) = orchestrator_clone.agents.get_mut(id) {
-                                target.config.model = agent.config.model.clone();
-                            }
-                        }
+                        self.workflow_cancel_token = Some(worker.cancel_token.clone());
 
-                        // Store cancellation token for this workflow
-                        let cancel_token = orchestrator_clone.cancel_token.clone();
-                        self.workflow_cancel_token = Some(cancel_token);
+                        let event_tx = self.event_tx.clone();
+                        let session_dir = self.session_dir.clone();
+                        let save_sessions = self.save_sessions;
+                        let provider_name = self.orchestrator.provider.name().to_string();
+                        let context_tokens = self.context_tokens;
+                        let topology_name = self.orchestrator.topology.name().to_string();
+                        let models: BTreeMap<String, String> = self
+                            .ordered_agents()
+                            .iter()
+                            .map(|a| (a.config.id.clone(), a.config.model.clone()))
+                            .collect();
+                        let started_at = Utc::now();
+                        let started = std::time::Instant::now();
+                        let history_tx = self.history_tx.clone();
 
-                        let event_tx_clone = self.event_tx.clone();
                         tokio::spawn(async move {
-                            match orchestrator_clone.execute_goal(&prompt).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    let msg = format!("{}", e);
-                                    if !msg.contains("cancelled") {
-                                        let _ = event_tx_clone.send(OrchestratorEvent::SystemLog {
-                                            level: "ERROR".to_string(),
-                                            target: "Orchestrator".to_string(),
-                                            message: format!("Workflow error: {}", e),
-                                            timestamp: Utc::now(),
-                                        });
-                                    }
+                            let outcome = worker.execute_goal(&prompt).await;
+
+                            if let Err(e) = &outcome {
+                                let msg = format!("{e}");
+                                if !msg.contains("cancelled") {
+                                    let _ = event_tx.send(OrchestratorEvent::SystemLog {
+                                        level: "ERROR".to_string(),
+                                        target: "Orchestrator".to_string(),
+                                        message: format!("Workflow error: {msg}"),
+                                        timestamp: Utc::now(),
+                                    });
                                 }
                             }
+
+                            // Hand the agents' updated histories back to the UI.
+                            let _ = history_tx.send(
+                                worker
+                                    .agents
+                                    .iter()
+                                    .map(|(id, agent)| (id.clone(), agent.history.clone()))
+                                    .collect(),
+                            );
+
+                            if !save_sessions {
+                                return;
+                            }
+                            let session = Session {
+                                started_at,
+                                goal: prompt,
+                                topology: topology_name,
+                                provider: provider_name,
+                                models,
+                                context_tokens,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                total_tokens: worker.total_tokens(),
+                                steps: worker
+                                    .step_outputs()
+                                    .iter()
+                                    .map(|(id, output)| StepRecord {
+                                        step_id: id.clone(),
+                                        output: output.clone(),
+                                    })
+                                    .collect(),
+                                final_output: outcome.unwrap_or_default(),
+                            };
+
+                            let message = match session.save(&session_dir).await {
+                                Ok(path) => format!("Session saved to {}", path.display()),
+                                Err(e) => format!("Could not save session: {e}"),
+                            };
+                            let _ = event_tx.send(OrchestratorEvent::SystemLog {
+                                level: "INFO".to_string(),
+                                target: "Session".to_string(),
+                                message,
+                                timestamp: Utc::now(),
+                            });
                         });
                     }
                 }
-                // `input_cursor_pos` counts characters, but `String::insert`
-                // and `String::remove` take byte offsets and panic anywhere
-                // else. Every edit below converts before touching the string,
-                // so typing an accent or an emoji no longer aborts the app.
                 KeyCode::Backspace => {
                     if self.input_cursor_pos > 0 {
                         let at = byte_offset(&self.prompt_input, self.input_cursor_pos - 1);
@@ -861,6 +1102,40 @@ impl App {
                     }
                     self.input_mode = InputMode::Normal;
                 }
+                _ => {}
+            },
+            InputMode::PromptEditor => match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::Normal;
+                    self.prompt_editor.clear();
+                }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.save_prompt_editor().await;
+                }
+                KeyCode::Enter => self.editor_insert('\n'),
+                KeyCode::Char(c) => self.editor_insert(c),
+                KeyCode::Backspace => {
+                    if self.prompt_editor_cursor > 0 {
+                        let at = byte_offset(&self.prompt_editor, self.prompt_editor_cursor - 1);
+                        self.prompt_editor.remove(at);
+                        self.prompt_editor_cursor -= 1;
+                    }
+                }
+                KeyCode::Delete => {
+                    let at = byte_offset(&self.prompt_editor, self.prompt_editor_cursor);
+                    if at < self.prompt_editor.len() {
+                        self.prompt_editor.remove(at);
+                    }
+                }
+                KeyCode::Left => {
+                    self.prompt_editor_cursor = self.prompt_editor_cursor.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    let len = self.prompt_editor.chars().count();
+                    self.prompt_editor_cursor = (self.prompt_editor_cursor + 1).min(len);
+                }
+                KeyCode::Home => self.prompt_editor_cursor = 0,
+                KeyCode::End => self.prompt_editor_cursor = self.prompt_editor.chars().count(),
                 _ => {}
             },
             InputMode::HelpModal => match key.code {

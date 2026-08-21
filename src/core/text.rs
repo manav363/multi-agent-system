@@ -26,6 +26,86 @@ pub fn byte_offset(s: &str, char_pos: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+/// Rough token count for budgeting.
+///
+/// ponytail: chars/4 is the standard English approximation and is wrong for
+/// code and CJK. It only has to be close enough to keep prompts inside the
+/// window with the safety margin the caller reserves; swap in a real tokenizer
+/// if the margin ever proves too tight.
+pub fn estimate_tokens(s: &str) -> usize {
+    s.chars().count().div_ceil(4)
+}
+
+/// Fraction of an answer that must be prose before it counts as buried.
+const PREAMBLE_RATIO: f64 = 0.55;
+/// Below this, a code block is a fragment being discussed, not the deliverable.
+const MIN_DELIVERABLE_CHARS: usize = 120;
+
+/// Pull the deliverable out of an answer that is mostly thinking-out-loud.
+///
+/// Disabling a model's reasoning mode stops it emitting a separate thinking
+/// block, but small models simply move the deliberation into the answer —
+/// "Okay, I need to… Wait, but…" for ten thousand characters before the code
+/// finally appears. Forwarding all of that gives the next agent deliberation to
+/// review instead of work.
+///
+/// Only applied when prose genuinely dominates: an explanation that accompanies
+/// its code is worth keeping, so the whole answer is returned unless the fenced
+/// blocks are outweighed by the talking around them.
+pub fn distill_answer(text: &str) -> String {
+    let blocks = fenced_blocks(text);
+    if blocks.is_empty() {
+        return text.to_string();
+    }
+
+    let code_chars: usize = blocks.iter().map(|b| b.chars().count()).sum();
+    let total = text.chars().count().max(1);
+    let prose_ratio = 1.0 - (code_chars as f64 / total as f64);
+
+    if prose_ratio < PREAMBLE_RATIO {
+        return text.to_string();
+    }
+
+    // Keep the largest block: a model that restates its answer several times
+    // usually gets closest to complete on the fullest attempt.
+    let Some(best) = blocks
+        .iter()
+        .filter(|b| b.chars().count() >= MIN_DELIVERABLE_CHARS)
+        .max_by_key(|b| b.chars().count())
+    else {
+        return text.to_string();
+    };
+
+    best.trim().to_string()
+}
+
+/// Contents of every ``` fenced block, ignoring the language tag.
+fn fenced_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<String> = None;
+
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            match current.take() {
+                Some(body) => blocks.push(body),
+                None => current = Some(String::new()),
+            }
+            continue;
+        }
+        if let Some(body) = current.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    // An unclosed block still holds the answer if the stream was cut short.
+    if let Some(body) = current {
+        if !body.trim().is_empty() {
+            blocks.push(body);
+        }
+    }
+    blocks
+}
+
 /// Why a stream was cut short.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
@@ -44,27 +124,38 @@ impl StopReason {
     }
 }
 
-/// Smallest repeating block we bother looking for.
+/// Smallest repeating block worth looking for.
 const MIN_PERIOD: usize = 6;
-/// Largest repeating block we look for.
-const MAX_PERIOD: usize = 160;
+/// Largest repeating block worth looking for.
+///
+/// Wide enough to catch a model cycling through a few paragraphs, not just a
+/// stuttering clause. Measured against this project's own source, README and
+/// tests: none contains an exact block repeated three times back to back at
+/// any period in this range.
+const MAX_PERIOD: usize = 600;
 /// How many back-to-back copies of a block count as a loop.
 const REPEATS_REQUIRED: usize = 3;
 /// Re-scan after this many new characters, so the scan cost stays amortised.
 const CHECK_INTERVAL: usize = 48;
-/// Length of the trailing fingerprint used for spiral detection.
-const SPIRAL_NGRAM: usize = 32;
-/// How many times that fingerprint may recur before it counts as a spiral.
-const SPIRAL_OCCURRENCES: usize = 4;
-/// History searched for spiral fingerprints — wider than the period scan,
-/// because a reasoning spiral cycles over paragraphs, not clauses.
-const SPIRAL_WINDOW: usize = 2400;
+/// History retained — enough to hold the longest repeat being searched for.
+const REPEAT_WINDOW: usize = MAX_PERIOD * (REPEATS_REQUIRED + 1);
 
 /// Watches a token stream for the two ways a small local model runs away:
 /// repeating itself forever, or never emitting a stop token.
 ///
 /// Feed every delta through [`RepetitionGuard::push`]; a `Some(reason)` means
 /// abandon the stream and keep whatever was produced so far.
+///
+/// Detection is deliberately limited to *exact* adjacent repetition. An earlier
+/// version also flagged frequently recurring n-grams, to catch a model circling
+/// a point in drifting words. Measuring that against real corpora killed it:
+/// this project's own `ui.rs` repeats a 48-character sequence 8 times in 2.4kB
+/// of ordinary code, while an observed model spiral repeated its most common
+/// 32-character sequence only 4 times. Legitimate code is *more* repetitive
+/// than the failure being detected, so no threshold separates them, and a
+/// heuristic that silently truncates working code is worse than the runaway it
+/// was meant to stop. The character budget remains the backstop for a model
+/// that circles without ever repeating itself exactly.
 pub struct RepetitionGuard {
     tail: String,
     chars_since_check: usize,
@@ -97,58 +188,25 @@ impl RepetitionGuard {
             return None;
         }
 
-        self.total_chars += delta.chars().count();
+        let added = delta.chars().count();
+        self.total_chars += added;
         if self.total_chars > self.max_chars {
             return Some(StopReason::BudgetExhausted);
         }
 
         self.tail.push_str(delta);
-        if self.tail.chars().count() > SPIRAL_WINDOW {
-            let excess = self.tail.chars().count() - SPIRAL_WINDOW;
-            self.tail = self.tail.chars().skip(excess).collect();
+        let len = self.tail.chars().count();
+        if len > REPEAT_WINDOW {
+            self.tail = self.tail.chars().skip(len - REPEAT_WINDOW).collect();
         }
 
-        self.chars_since_check += delta.chars().count();
+        self.chars_since_check += added;
         if self.chars_since_check < CHECK_INTERVAL {
             return None;
         }
         self.chars_since_check = 0;
 
-        if has_trailing_repetition(&self.tail) || is_spiralling(&self.tail) {
-            Some(StopReason::Repetition)
-        } else {
-            None
-        }
-    }
-}
-
-/// True when the most recent fingerprint keeps resurfacing across the window.
-///
-/// Catches the failure mode that adjacent-block matching misses: a small model
-/// circling the same thought in slightly different words — "Wait, but the
-/// problem says…", "Wait, the problem states…" — forever. The wording drifts,
-/// but the opening of each cycle repeats verbatim.
-fn is_spiralling(text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() < SPIRAL_NGRAM * SPIRAL_OCCURRENCES {
-        return false;
-    }
-
-    let fingerprint: String = chars[chars.len() - SPIRAL_NGRAM..].iter().collect();
-    // Whitespace and rules repeat legitimately (indentation, separators).
-    if fingerprint.trim().is_empty() || is_uniform(&fingerprint) {
-        return false;
-    }
-
-    text.matches(fingerprint.as_str()).count() >= SPIRAL_OCCURRENCES
-}
-
-/// True when every character in `s` is the same — padding, not content.
-fn is_uniform(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => chars.all(|c| c == first),
-        None => true,
+        has_trailing_repetition(&self.tail).then_some(StopReason::Repetition)
     }
 }
 
@@ -159,21 +217,20 @@ fn has_trailing_repetition(text: &str) -> bool {
     let n = chars.len();
 
     for period in MIN_PERIOD..=MAX_PERIOD {
-        let span = period * REPEATS_REQUIRED;
-        if span > n {
+        if period * REPEATS_REQUIRED > n {
             break;
         }
         let block = &chars[n - period..];
-        // A block of one repeated character is normal formatting (rules, indent
-        // padding, "-----"), not a decoder loop.
-        if block.iter().all(|c| c == &block[0]) {
+        // Rules, indentation and table borders repeat legitimately. Content
+        // always carries at least one alphanumeric character.
+        if !block.iter().any(|c| c.is_alphanumeric()) {
             continue;
         }
-        let all_match = (1..REPEATS_REQUIRED).all(|k| {
+        let repeats = (1..REPEATS_REQUIRED).all(|k| {
             let end = n - period * k;
             &chars[end - period..end] == block
         });
-        if all_match {
+        if repeats {
             return true;
         }
     }
@@ -218,8 +275,157 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_buried_under_reasoning_is_reduced_to_its_code() {
+        // The shape qwen3:4b produces once its thinking block is disabled: the
+        // deliberation simply moves into the answer.
+        let buried = format!(
+            "Okay, I need to write this. {}\n```rust\n{}\n```\nWait, but let me reconsider. {}",
+            "Let me think about the edge cases at some length. ".repeat(40),
+            "pub fn fib(n: u32) -> u32 {\n    let (mut a, mut b) = (0, 1);\n    for _ in 0..n { let c = a + b; a = b; b = c; }\n    a\n}",
+            "Actually the base case might differ. ".repeat(40),
+        );
+
+        let distilled = distill_answer(&buried);
+        assert!(distilled.starts_with("pub fn fib"));
+        assert!(!distilled.contains("Okay, I need"));
+        assert!(!distilled.contains("Wait, but"));
+    }
+
+    #[test]
+    fn a_normal_answer_with_its_explanation_is_left_alone() {
+        let normal = "Here is the implementation:\n\n```rust\npub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn adds() { assert_eq!(add(2, 2), 4); }\n}\n```\n\nIt uses checked arithmetic in debug builds.";
+        assert_eq!(
+            distill_answer(normal),
+            normal,
+            "code-dominant answers stay whole"
+        );
+    }
+
+    #[test]
+    fn prose_with_no_code_is_never_touched() {
+        let review = "The implementation looks correct. One concern: the loop bound is off by one for n = 0, and the test does not cover it.";
+        assert_eq!(distill_answer(review), review);
+    }
+
+    #[test]
+    fn a_tiny_snippet_inside_discussion_is_not_mistaken_for_the_answer() {
+        let chat = format!(
+            "{}\n```\nlet x = 1;\n```\n{}",
+            "I am considering the options here at length. ".repeat(30),
+            "But that is only an illustration of the idea. ".repeat(30),
+        );
+        // The snippet is under the deliverable threshold, so the answer stands.
+        assert_eq!(distill_answer(&chat), chat);
+    }
+
+    #[test]
+    fn the_fullest_attempt_wins_when_a_model_restates_itself() {
+        let text = format!(
+            "{}\n```rust\nfn short() {{}}\n```\n{}\n```rust\n{}\n```\n{}",
+            "Thinking out loud about this problem. ".repeat(30),
+            "Hmm, that was incomplete, let me redo it. ".repeat(10),
+            "pub fn complete(n: u32) -> u32 {\n    // the full version with everything in place\n    let (mut a, mut b) = (0u32, 1u32);\n    for _ in 0..n { let c = a + b; a = b; b = c; }\n    a\n}",
+            "That should be right. ".repeat(30),
+        );
+        let distilled = distill_answer(&text);
+        assert!(distilled.contains("pub fn complete"));
+        assert!(!distilled.contains("fn short"));
+    }
+
+    #[test]
+    fn an_unclosed_block_from_a_truncated_stream_still_yields_its_code() {
+        let cut = format!(
+            "{}\n```rust\npub fn fib(n: u32) -> u32 {{\n    let (mut a, mut b) = (0, 1);\n    for _ in 0..n {{ let c = a + b; a = b; b = c; }}\n    a\n}}",
+            "Let me reason about this for a while first. ".repeat(40),
+        );
+        assert!(distill_answer(&cut).starts_with("pub fn fib"));
+    }
+
+    #[test]
+    fn token_estimate_scales_with_length() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+        // Counts characters, not bytes: a 3-byte glyph is one character.
+        assert_eq!(estimate_tokens("日日日日"), 1);
+    }
+
+    #[test]
     fn preview_flattens_newlines() {
         assert_eq!(preview_line("a\n\n  b\tc ", 40), "a b c");
+    }
+
+    /// Feed `text` in one character at a time and report where the guard fires.
+    fn fire_point(text: &str, max_tokens: Option<usize>) -> Option<usize> {
+        let mut guard = RepetitionGuard::new(max_tokens);
+        for (i, ch) in text.char_indices() {
+            if guard.push(&text[i..i + ch.len_utf8()]).is_some() {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// The safety property, checked against this project's own source: real
+    /// code is highly repetitive, and none of it may be truncated.
+    #[test]
+    fn the_guard_never_fires_on_real_source_or_prose() {
+        let corpora: &[(&str, &str)] = &[
+            ("orchestrator.rs", include_str!("orchestrator.rs")),
+            ("text.rs", include_str!("text.rs")),
+            ("prompt.rs", include_str!("prompt.rs")),
+            ("topology.rs", include_str!("topology.rs")),
+            ("ui.rs", include_str!("../tui/ui.rs")),
+        ];
+        for (name, body) in corpora {
+            assert_eq!(
+                fire_point(body, Some(1_000_000)),
+                None,
+                "false positive on {name}"
+            );
+        }
+    }
+
+    /// A model regenerating the same paragraphs in a cycle is caught, even
+    /// though each individual paragraph differs from its neighbours.
+    #[test]
+    fn a_cycling_spiral_is_caught() {
+        let cycle = concat!(
+            "Wait, but the problem says the code must be complete, so errors need handling.\n",
+            "Wait, but the problem says the strategy uses Result, so it should return Result.\n",
+            "Wait, but the problem says production-ready, so a no-op will not do.\n",
+        );
+        let spiral = cycle.repeat(6);
+        assert!(
+            fire_point(&spiral, Some(1_000_000)).is_some(),
+            "a verbatim repeating cycle must be caught"
+        );
+    }
+
+    /// A model circling a point in *drifting* words is explicitly out of scope
+    /// for repetition detection — see the note on `RepetitionGuard`. The
+    /// character budget is what bounds it.
+    #[test]
+    fn a_drifting_spiral_is_bounded_by_the_budget_not_the_detector() {
+        let drifting: String = (0..400)
+            .map(|i| format!("Wait, but the problem says {i}, so I should reconsider point {i}.\n"))
+            .collect();
+
+        assert_eq!(
+            fire_point(&drifting, Some(1_000_000)),
+            None,
+            "drifting text has no exact repeat; the detector must stay quiet"
+        );
+
+        let mut guard = RepetitionGuard::new(Some(256)); // 2048 char budget
+        let mut stopped = None;
+        for (i, ch) in drifting.char_indices() {
+            if let Some(reason) = guard.push(&drifting[i..i + ch.len_utf8()]) {
+                stopped = Some(reason);
+                break;
+            }
+        }
+        assert_eq!(stopped, Some(StopReason::BudgetExhausted));
     }
 
     #[test]
@@ -230,31 +436,6 @@ mod tests {
             if let Some(r) = guard.push("fn main() { todo!() }\n") {
                 tripped = Some(r);
                 break;
-            }
-        }
-        assert_eq!(tripped, Some(StopReason::Repetition));
-    }
-
-    /// The symptom actually observed from qwen3:4b: the same opening phrase
-    /// restated forever with drifting wording, which adjacent-block matching
-    /// alone does not catch.
-    #[test]
-    fn guard_catches_a_reasoning_spiral_with_drifting_wording() {
-        let mut guard = RepetitionGuard::new(Some(100_000));
-        let variations = [
-            "Wait, but the problem says that the code must be complete. So I need to handle errors here.\n",
-            "Wait, but the problem says the error strategy uses Result. So the function should return Result.\n",
-            "Wait, but the problem says it must be production-ready. So we cannot leave a no-op.\n",
-            "Wait, but the problem says to implement it per the roadmap. So let us write it out.\n",
-            "Wait, but the problem says the blueprint shows Result. So we follow the blueprint.\n",
-        ];
-        let mut tripped = None;
-        'outer: for _ in 0..8 {
-            for v in &variations {
-                if let Some(r) = guard.push(v) {
-                    tripped = Some(r);
-                    break 'outer;
-                }
             }
         }
         assert_eq!(tripped, Some(StopReason::Repetition));
