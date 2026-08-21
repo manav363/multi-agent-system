@@ -1,55 +1,488 @@
 use crate::core::agent::{Agent, AgentRole};
 use crate::core::events::{AgentStatus, OrchestratorEvent};
 use crate::core::memory::SharedBlackboard;
-use crate::core::text::{preview_line, truncate_chars, RepetitionGuard};
-use crate::llm::provider::{LlmProvider, ToolCall};
+use crate::core::prompt::{fit, Section, ARTIFACT_PRIORITY};
+use crate::core::text::{
+    distill_answer, estimate_tokens, preview_line, truncate_chars, RepetitionGuard,
+};
+use crate::core::topology::{ReviewLoop, StepSpec, TopologyMode};
+use crate::llm::provider::{ChatOptions, LlmProvider, ToolCall};
+use crate::tools::coordination::{BlackboardReadTool, BlackboardWriteTool, ConsultAgentTool};
 use crate::tools::tool::ToolRegistry;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TopologyMode {
-    Hierarchical,
-    AssemblyLine,
-    DebateReview,
-    DirectCoder,
+/// Default context window to request. Large enough for a full pipeline, small
+/// enough that the KV cache stays affordable on consumer hardware.
+pub const DEFAULT_CONTEXT_TOKENS: usize = 16_384;
+
+/// Held back from the context window for the model's own reply, plus slack for
+/// the token estimate.
+const OUTPUT_RESERVE_TOKENS: usize = 2_048;
+
+/// Tool rounds allowed within one step, for agents that hold tools.
+const MAX_TOOL_ROUNDS: usize = 3;
+
+/// Tool calls honoured in a single round.
+const MAX_CALLS_PER_ROUND: usize = 4;
+
+/// What one completed step produced.
+#[derive(Debug)]
+struct StepOutcome {
+    agent: Agent,
+    output: String,
+    tokens: usize,
 }
 
-impl TopologyMode {
-    /// Number of agent steps this topology runs, for progress reporting.
-    pub fn step_count(&self) -> usize {
-        match self {
-            TopologyMode::Hierarchical => 5,
-            TopologyMode::AssemblyLine => 5,
-            TopologyMode::DebateReview => 5,
-            TopologyMode::DirectCoder => 1,
+/// Everything a step needs in order to run without borrowing the orchestrator.
+///
+/// Steps in the same dependency level run concurrently, so each task gets its
+/// own cheap clone of this rather than a shared `&mut Orchestrator`.
+#[derive(Clone)]
+struct StepRunner {
+    provider: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    event_tx: Option<UnboundedSender<OrchestratorEvent>>,
+    cancel: CancellationToken,
+    total_steps: usize,
+    workflow_start: Instant,
+    context_tokens: usize,
+}
+
+impl StepRunner {
+    fn emit(&self, event: OrchestratorEvent) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event);
         }
     }
 
-    pub fn name(&self) -> &'static str {
-        match self {
-            TopologyMode::Hierarchical => "Hierarchical Swarm",
-            TopologyMode::AssemblyLine => "Assembly Line (Pipeline)",
-            TopologyMode::DebateReview => "Peer Review & Debate",
-            TopologyMode::DirectCoder => "Direct Engineer",
+    fn set_status(&self, agent: &mut Agent, status: AgentStatus) {
+        let old = agent.status;
+        agent.status = status;
+        self.emit(OrchestratorEvent::AgentStatusChanged {
+            agent_id: agent.config.id.clone(),
+            role: agent.config.role.name().to_string(),
+            old_status: old,
+            new_status: status,
+            timestamp: Utc::now(),
+        });
+    }
+
+    /// Tokens available for the prompt, once the reply is accounted for.
+    fn prompt_budget(&self, max_tokens: Option<usize>) -> usize {
+        let reserve = max_tokens.unwrap_or(OUTPUT_RESERVE_TOKENS) + 512;
+        self.context_tokens.saturating_sub(reserve).max(512)
+    }
+
+    /// A status that reflects what this agent is actually doing.
+    fn working_status(role: &AgentRole) -> AgentStatus {
+        match role {
+            AgentRole::Planner => AgentStatus::Planning,
+            AgentRole::Critic => AgentStatus::Evaluating,
+            _ => AgentStatus::Thinking,
         }
     }
 
-    pub fn description(&self) -> &'static str {
-        match self {
-            TopologyMode::Hierarchical => "Scout researches context -> Architect plans -> Engineer codes -> Critic audits -> Synthesizer delivers",
-            TopologyMode::AssemblyLine => "Linear chain: Scout -> Architect -> Engineer -> Critic -> Synthesizer",
-            TopologyMode::DebateReview => "Scout researches -> Engineer drafts -> Critic audits -> Engineer refines -> Synthesizer delivers",
-            TopologyMode::DirectCoder => "Direct single-agent with tool execution access",
+    /// Run a step, retrying a failure up to twice.
+    ///
+    /// This lives on the runner rather than the orchestrator because steps in a
+    /// parallel level execute inside spawned tasks — a retry ladder that needed
+    /// `&mut Orchestrator` would silently apply to sequential steps only.
+    async fn run_with_retry(
+        &self,
+        agent: Agent,
+        step_index: usize,
+        title: &str,
+        prompt: String,
+    ) -> Result<StepOutcome> {
+        const MAX_RETRIES: u32 = 2;
+        let mut last_error = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            if self.cancel.is_cancelled() {
+                anyhow::bail!("Workflow cancelled by user");
+            }
+
+            let mut candidate = agent.clone();
+            if attempt > 0 {
+                self.emit(OrchestratorEvent::SystemLog {
+                    level: "WARN".to_string(),
+                    target: "Orchestrator".to_string(),
+                    message: format!(
+                        "Retrying '{}' (attempt {}/{})",
+                        title,
+                        attempt + 1,
+                        MAX_RETRIES + 1
+                    ),
+                    timestamp: Utc::now(),
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
+                    .await;
+                candidate.clear_history();
+            }
+
+            match self.run(candidate, step_index, title, prompt.clone()).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(e) => {
+                    // A cancelled workflow must not be retried — the user asked
+                    // it to stop, so burning two more attempts ignores them.
+                    if self.cancel.is_cancelled() {
+                        return Err(e);
+                    }
+                    self.emit(OrchestratorEvent::SystemLog {
+                        level: "ERROR".to_string(),
+                        target: "Orchestrator".to_string(),
+                        // `{:#}` prints the whole anyhow chain. Plain `{}` shows
+                        // only the outermost context, which turns every failure
+                        // into an unactionable one-liner.
+                        message: format!("'{}' attempt {} failed: {:#}", title, attempt + 1, e),
+                        timestamp: Utc::now(),
+                    });
+                    last_error = Some(e);
+                }
+            }
         }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error")))
+    }
+
+    async fn run(
+        &self,
+        mut agent: Agent,
+        step_index: usize,
+        title: &str,
+        prompt: String,
+    ) -> Result<StepOutcome> {
+        let started = Instant::now();
+        let start_offset_ms = self.workflow_start.elapsed().as_millis() as u64;
+        let agent_id = agent.config.id.clone();
+        let role_name = agent.config.role.name().to_string();
+
+        self.emit(OrchestratorEvent::WorkflowStepStarted {
+            step_index,
+            total_steps: self.total_steps,
+            title: title.to_string(),
+            agent_id: agent_id.clone(),
+            timestamp: Utc::now(),
+        });
+
+        let working = Self::working_status(&agent.config.role);
+        self.set_status(&mut agent, working);
+
+        let enabled_tools = agent.config.enabled_tools.clone();
+        // An agent with no tools gets exactly one pass, and its output is never
+        // scanned for tool calls. Otherwise JSON inside the code it was asked to
+        // write gets executed as a call, and the result re-prompts it for more
+        // code — the Engineer loop.
+        let max_rounds = if enabled_tools.is_empty() {
+            1
+        } else {
+            MAX_TOOL_ROUNDS
+        };
+
+        let mut current_prompt = prompt;
+        // The answer is the last round that produced one, not every round
+        // concatenated. Text an agent writes alongside a tool call is preamble
+        // ("saving both files now"); joining it to the final answer duplicated
+        // whole deliverables in the output.
+        let mut answer = String::new();
+        let mut tool_calls_made = 0usize;
+        let mut step_tokens = 0usize;
+
+        for round in 0..max_rounds {
+            if self.cancel.is_cancelled() {
+                anyhow::bail!("Workflow cancelled by user");
+            }
+
+            // The last round is offered no tools at all. Without this an agent
+            // can spend every round calling tools and never write an answer,
+            // so the step ends empty, retries, and repeats the same pattern.
+            let final_round = round + 1 == max_rounds;
+            if final_round && round > 0 {
+                current_prompt = "You have no more tool calls available. Write your complete \
+                                  final response now, using what you have already gathered."
+                    .to_string();
+            }
+
+            agent.add_user_message(&current_prompt);
+
+            let active_tools = if final_round {
+                Vec::new()
+            } else {
+                self.tools.tools_for(&enabled_tools)
+            };
+            let messages = agent.history.clone();
+
+            self.set_status(&mut agent, AgentStatus::Streaming);
+
+            let mut stream = self
+                .provider
+                .stream_chat(
+                    &agent.config.model,
+                    &messages,
+                    &ChatOptions {
+                        temperature: agent.config.temperature,
+                        max_tokens: agent.config.max_tokens,
+                        thinking: agent.config.thinking,
+                    },
+                    &active_tools,
+                )
+                .await
+                .with_context(|| format!("Failed to stream chat for agent {agent_id}"))?;
+
+            // Reasoning and answer are accumulated separately. Ollama delivers
+            // chain-of-thought in a `thinking` field that carries no `<think>`
+            // tags, so mixing the two streams put raw reasoning into the step
+            // output — downstream agents then received deliberation instead of
+            // code and reported that no code was provided.
+            let mut response = String::new();
+            let mut thought_chars = 0usize;
+            let mut native_calls: Vec<ToolCall> = Vec::new();
+            let mut guard = RepetitionGuard::new(agent.config.max_tokens);
+            let mut reported_tokens = None;
+            let mut chunk_count = 0usize;
+            let mut stop_reason = None;
+
+            while let Some(chunk_res) = stream.next().await {
+                if self.cancel.is_cancelled() {
+                    anyhow::bail!("Workflow cancelled by user");
+                }
+
+                let chunk = chunk_res
+                    .map_err(|e| anyhow::anyhow!("Stream error in agent {agent_id}: {e}"))?;
+
+                if !chunk.tool_calls.is_empty() {
+                    native_calls.extend(chunk.tool_calls);
+                }
+                if chunk.completion_tokens.is_some() {
+                    reported_tokens = chunk.completion_tokens;
+                }
+                if chunk.delta.is_empty() {
+                    continue;
+                }
+
+                if let Some(reason) = guard.push(&chunk.delta) {
+                    stop_reason = Some(reason);
+                }
+
+                chunk_count += 1;
+                if chunk.is_thought {
+                    thought_chars += chunk.delta.chars().count();
+                } else {
+                    response.push_str(&chunk.delta);
+                }
+
+                self.emit(OrchestratorEvent::AgentTokenChunk {
+                    agent_id: agent_id.clone(),
+                    role: role_name.clone(),
+                    delta: chunk.delta,
+                    is_thought: chunk.is_thought,
+                    timestamp: Utc::now(),
+                });
+
+                if stop_reason.is_some() {
+                    break;
+                }
+            }
+            // Dropping the stream stops the provider task feeding it, so an
+            // abandoned generation stops costing time on the model server.
+            drop(stream);
+
+            if let Some(reason) = stop_reason {
+                self.emit(OrchestratorEvent::SystemLog {
+                    level: "WARN".to_string(),
+                    target: role_name.clone(),
+                    message: format!(
+                        "Output cut short after {} chars: {}. Keeping what was generated.",
+                        guard.total_chars(),
+                        reason.as_str()
+                    ),
+                    timestamp: Utc::now(),
+                });
+            }
+
+            step_tokens += reported_tokens.unwrap_or(chunk_count);
+
+            // A turn that produced only reasoning has not answered. Saying so
+            // beats forwarding the deliberation as though it were the result.
+            if response.trim().is_empty() && thought_chars > 0 {
+                self.emit(OrchestratorEvent::SystemLog {
+                    level: "WARN".to_string(),
+                    target: role_name.clone(),
+                    message: format!(
+                        "Produced {thought_chars} characters of reasoning but no answer."
+                    ),
+                    timestamp: Utc::now(),
+                });
+            }
+
+            if !response.trim().is_empty() {
+                answer = response.clone();
+            }
+
+            let calls = if final_round {
+                Vec::new()
+            } else {
+                self.authorised_calls(&native_calls, &response, &enabled_tools)
+            };
+            agent.add_assistant_turn(&response, calls.clone());
+
+            if calls.is_empty() {
+                break;
+            }
+
+            // Every requested call runs in this round. Taking only the first
+            // silently dropped the rest and forced a needless extra round-trip.
+            self.set_status(&mut agent, AgentStatus::CallingTool);
+            for call in calls {
+                tool_calls_made += 1;
+                let result = self.execute_call(&agent_id, &call).await?;
+                agent.add_tool_result(&result, &call.name, &call.id);
+            }
+
+            current_prompt = "Use the tool results above to complete your task. Write your final \
+                              response now; call another tool only if you genuinely cannot proceed \
+                              without it."
+                .to_string();
+        }
+
+        self.set_status(&mut agent, AgentStatus::Done);
+
+        // Strip tags, then pull the deliverable out if the model buried it under
+        // paragraphs of thinking-out-loud. Downstream agents should receive the
+        // work, not the deliberation about the work.
+        let cleaned = clean_agent_output(&answer);
+        let output = distill_answer(&cleaned);
+        if output.chars().count() * 2 < cleaned.chars().count() {
+            self.emit(OrchestratorEvent::SystemLog {
+                level: "INFO".to_string(),
+                target: role_name.clone(),
+                message: format!(
+                    "Answer was buried in reasoning; kept the {} characters that matter (of {}).",
+                    output.chars().count(),
+                    cleaned.chars().count()
+                ),
+                timestamp: Utc::now(),
+            });
+        }
+
+        // An agent that produced no answer has not done its step. Returning an
+        // error hands it to the retry ladder, which clears the history and
+        // tries again — often enough to shake a model out of a reasoning
+        // spiral. Exhausting the retries degrades to a marker, as with any
+        // other failure.
+        if output.is_empty() {
+            self.set_status(&mut agent, AgentStatus::Error);
+            anyhow::bail!("Agent {agent_id} produced no answer");
+        }
+
+        self.emit(OrchestratorEvent::WorkflowStepFinished {
+            step_index,
+            title: title.to_string(),
+            agent_id,
+            duration_ms: started.elapsed().as_millis() as u64,
+            start_offset_ms,
+            tokens: step_tokens,
+            tool_calls: tool_calls_made,
+            success: true,
+            output_preview: preview_line(&output, 160),
+            timestamp: Utc::now(),
+        });
+
+        Ok(StepOutcome {
+            agent,
+            output,
+            tokens: step_tokens,
+        })
+    }
+
+    /// Run one tool call, abandoning it if the workflow is cancelled.
+    async fn execute_call(&self, agent_id: &str, call: &ToolCall) -> Result<String> {
+        let started = Instant::now();
+
+        self.emit(OrchestratorEvent::ToolCallStarted {
+            agent_id: agent_id.to_string(),
+            tool_name: call.name.clone(),
+            args: truncate_chars(&call.arguments.to_string(), 2000),
+            call_id: call.id.clone(),
+            timestamp: Utc::now(),
+        });
+
+        // Awaiting the tool bare meant Esc could not interrupt a long shell
+        // command; the UI accepted the cancel and then appeared frozen.
+        let outcome = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                anyhow::bail!("Workflow cancelled by user");
+            }
+            res = self.tools.execute(&call.name, call.arguments.clone()) => res,
+        };
+
+        let (result, is_error) = match outcome {
+            Ok(out) => (out, false),
+            Err(e) => (format!("Tool execution error: {e}"), true),
+        };
+
+        self.emit(OrchestratorEvent::ToolCallFinished {
+            agent_id: agent_id.to_string(),
+            tool_name: call.name.clone(),
+            call_id: call.id.clone(),
+            result: result.clone(),
+            is_error,
+            duration_ms: started.elapsed().as_millis() as u64,
+            timestamp: Utc::now(),
+        });
+
+        Ok(result)
+    }
+
+    /// Calls this agent is actually permitted to make.
+    ///
+    /// Native calls are trusted first, then the text is scraped. Either way the
+    /// name must be on the agent's own allow-list, so an agent cannot reach a
+    /// tool it was not given, and prose that merely looks like a call cannot
+    /// become one.
+    fn authorised_calls(
+        &self,
+        native: &[ToolCall],
+        text: &str,
+        enabled_tools: &[String],
+    ) -> Vec<ToolCall> {
+        if enabled_tools.is_empty() {
+            return Vec::new();
+        }
+
+        let candidates: Vec<ToolCall> = if native.is_empty() {
+            parse_tool_call(text).into_iter().collect()
+        } else {
+            native.to_vec()
+        };
+
+        let mut allowed = Vec::new();
+        for call in candidates.into_iter().take(MAX_CALLS_PER_ROUND) {
+            if enabled_tools.contains(&call.name) {
+                allowed.push(call);
+            } else {
+                self.emit(OrchestratorEvent::SystemLog {
+                    level: "WARN".to_string(),
+                    target: "Orchestrator".to_string(),
+                    message: format!(
+                        "Ignoring call to '{}': not in this agent's enabled tools.",
+                        call.name
+                    ),
+                    timestamp: Utc::now(),
+                });
+            }
+        }
+        allowed
     }
 }
 
@@ -61,68 +494,30 @@ pub struct Orchestrator {
     pub blackboard: SharedBlackboard,
     pub event_tx: Option<UnboundedSender<OrchestratorEvent>>,
     pub cancel_token: CancellationToken,
-    /// Running token count across the whole workflow, reconciled against
-    /// provider-reported usage whenever the backend supplies it.
+    /// Context window to budget prompts against.
+    pub context_tokens: usize,
     total_tokens: usize,
-    /// Set when a goal starts; the origin for waterfall offsets.
-    workflow_start: Option<Instant>,
-    /// Cumulative tokens per agent for the whole workflow. Reconciliation
-    /// replaces an agent's count outright, so a per-step figure would erase
-    /// earlier steps for any agent that runs twice (the Debate topology's
-    /// Engineer drafts, then refines).
     agent_token_totals: HashMap<String, usize>,
+    workflow_start: Option<Instant>,
+    /// Every step's output in completion order — the record a session is built from.
+    step_outputs: Vec<(String, String)>,
 }
 
 impl Orchestrator {
-    pub fn new(
+    /// Build from an explicit roster, so the agent set can come from config.
+    pub fn from_agents(
         topology: TopologyMode,
         provider: Arc<dyn LlmProvider>,
-        default_model: &str,
+        roster: Vec<Agent>,
         tools: ToolRegistry,
         event_tx: Option<UnboundedSender<OrchestratorEvent>>,
     ) -> Self {
-        Self::with_models(
-            topology,
-            provider,
-            default_model,
-            default_model,
-            default_model,
-            default_model,
-            default_model,
-            tools,
-            event_tx,
-        )
-    }
+        let agents: HashMap<String, Agent> = roster
+            .into_iter()
+            .map(|a| (a.config.id.clone(), a))
+            .collect();
 
-    /// One model per role. The parameter list is long by design — collapsing it
-    /// into a struct would only move the same five names somewhere else.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_models(
-        topology: TopologyMode,
-        provider: Arc<dyn LlmProvider>,
-        planner_model: &str,
-        researcher_model: &str,
-        coder_model: &str,
-        critic_model: &str,
-        synthesizer_model: &str,
-        tools: ToolRegistry,
-        event_tx: Option<UnboundedSender<OrchestratorEvent>>,
-    ) -> Self {
-        let mut agents = HashMap::new();
-
-        let researcher = Agent::researcher(researcher_model);
-        let planner = Agent::planner(planner_model);
-        let coder = Agent::coder(coder_model);
-        let critic = Agent::critic(critic_model);
-        let synthesizer = Agent::synthesizer(synthesizer_model);
-
-        agents.insert(researcher.config.id.clone(), researcher);
-        agents.insert(planner.config.id.clone(), planner);
-        agents.insert(coder.config.id.clone(), coder);
-        agents.insert(critic.config.id.clone(), critic);
-        agents.insert(synthesizer.config.id.clone(), synthesizer);
-
-        Self {
+        let mut orchestrator = Self {
             topology,
             agents,
             provider,
@@ -130,19 +525,44 @@ impl Orchestrator {
             blackboard: SharedBlackboard::new(),
             event_tx,
             cancel_token: CancellationToken::new(),
+            context_tokens: DEFAULT_CONTEXT_TOKENS,
             total_tokens: 0,
-            workflow_start: None,
             agent_token_totals: HashMap::new(),
-        }
+            workflow_start: None,
+            step_outputs: Vec::new(),
+        };
+        orchestrator.register_coordination_tools();
+        orchestrator
     }
 
-    /// Share an existing blackboard instead of owning a private one.
-    ///
-    /// The TUI spawns the workflow on a separate `Orchestrator`, so without
-    /// this the app's blackboard stays empty forever and the Blackboard tab has
-    /// nothing real to show.
+    /// Bind the coordination tools to this orchestrator's own memory and roster.
+    fn register_coordination_tools(&mut self) {
+        self.tools
+            .register(Arc::new(BlackboardReadTool::new(self.blackboard.clone())));
+        self.tools
+            .register(Arc::new(BlackboardWriteTool::new(self.blackboard.clone())));
+
+        let roster: HashMap<String, crate::core::agent::AgentConfig> = self
+            .agents
+            .values()
+            .map(|a| (a.config.id.clone(), a.config.clone()))
+            .collect();
+        self.tools.register(Arc::new(ConsultAgentTool::new(
+            self.provider.clone(),
+            roster,
+        )));
+    }
+
+    /// Share an existing blackboard, so the UI observes the same memory the
+    /// running workflow writes into.
     pub fn with_blackboard(mut self, blackboard: SharedBlackboard) -> Self {
         self.blackboard = blackboard;
+        self.register_coordination_tools();
+        self
+    }
+
+    pub fn with_context_tokens(mut self, tokens: usize) -> Self {
+        self.context_tokens = tokens;
         self
     }
 
@@ -150,15 +570,16 @@ impl Orchestrator {
         for agent in self.agents.values_mut() {
             agent.config.model = model.to_string();
         }
+        self.register_coordination_tools();
     }
 
-    #[allow(dead_code)]
-    pub fn set_model_for_role(&mut self, role: &AgentRole, model: &str) {
-        for agent in self.agents.values_mut() {
-            if &agent.config.role == role {
-                agent.config.model = model.to_string();
-            }
-        }
+    /// Outputs of every step, in completion order.
+    pub fn step_outputs(&self) -> &[(String, String)] {
+        &self.step_outputs
+    }
+
+    pub fn total_tokens(&self) -> usize {
+        self.total_tokens
     }
 
     fn emit(&self, event: OrchestratorEvent) {
@@ -167,27 +588,344 @@ impl Orchestrator {
         }
     }
 
-    fn set_agent_status(&mut self, agent_id: &str, new_status: AgentStatus) {
-        let status_info = if let Some(agent) = self.agents.get_mut(agent_id) {
-            let old_status = agent.status;
-            agent.status = new_status;
-            Some((old_status, agent.config.role.name().to_string()))
-        } else {
-            None
-        };
-
-        if let Some((old_status, role)) = status_info {
-            self.emit(OrchestratorEvent::AgentStatusChanged {
-                agent_id: agent_id.to_string(),
-                role,
-                old_status,
-                new_status,
-                timestamp: Utc::now(),
-            });
+    fn runner(&self) -> StepRunner {
+        StepRunner {
+            provider: self.provider.clone(),
+            tools: self.tools.clone(),
+            event_tx: self.event_tx.clone(),
+            cancel: self.cancel_token.clone(),
+            total_steps: self.topology.max_steps(),
+            workflow_start: self.workflow_start.unwrap_or_else(Instant::now),
+            context_tokens: self.context_tokens,
         }
     }
 
-    /// Check if the workflow has been cancelled
+    /// Run the multi-agent workflow for the given goal.
+    pub async fn execute_goal(&mut self, user_goal: &str) -> Result<String> {
+        let start = Instant::now();
+        self.workflow_start = Some(start);
+        self.total_tokens = 0;
+        self.agent_token_totals.clear();
+        self.step_outputs.clear();
+        self.blackboard.clear().await;
+        self.blackboard.set("user_goal", user_goal).await;
+
+        self.emit(OrchestratorEvent::SystemLog {
+            level: "INFO".to_string(),
+            target: "Orchestrator".to_string(),
+            message: format!(
+                "Starting {} with goal: {}",
+                self.topology.name(),
+                preview_line(user_goal, 120)
+            ),
+            timestamp: Utc::now(),
+        });
+
+        let levels = self
+            .topology
+            .levels()
+            .map_err(|e| anyhow::anyhow!("Invalid topology '{}': {e}", self.topology.name()))?;
+
+        let mut outputs: HashMap<String, String> = HashMap::new();
+        let mut step_index = 0usize;
+
+        for level in levels {
+            self.check_cancelled()?;
+            step_index = self
+                .run_level(&level, user_goal, &mut outputs, step_index)
+                .await?;
+
+            // A failing review earns the author another attempt, bounded.
+            if let Some(review) = self.topology.review_loop() {
+                if level.iter().any(|s| s.id == review.verdict_step) {
+                    step_index = self
+                        .run_review_loop(review, user_goal, &mut outputs, step_index)
+                        .await?;
+                }
+            }
+        }
+
+        let final_output = outputs
+            .get(self.topology.terminal_step())
+            .cloned()
+            .unwrap_or_else(|| "No output produced.".to_string());
+
+        self.emit(OrchestratorEvent::WorkflowOverallCompleted {
+            topology: self.topology.name().to_string(),
+            total_duration_ms: start.elapsed().as_millis() as u64,
+            total_tokens: self.total_tokens,
+            summary: final_output.clone(),
+            timestamp: Utc::now(),
+        });
+
+        Ok(final_output)
+    }
+
+    /// Run one dependency level, concurrently when it holds more than one step.
+    async fn run_level(
+        &mut self,
+        level: &[&'static StepSpec],
+        user_goal: &str,
+        outputs: &mut HashMap<String, String>,
+        mut step_index: usize,
+    ) -> Result<usize> {
+        let runner = self.runner();
+        let mut planned = Vec::new();
+
+        for spec in level {
+            step_index += 1;
+            let agent = self
+                .agents
+                .get(spec.agent_id)
+                .with_context(|| format!("Topology names unknown agent '{}'", spec.agent_id))?
+                .clone();
+            let prompt = self.build_prompt(
+                spec.instruction,
+                spec.depends_on,
+                user_goal,
+                outputs,
+                &agent,
+            );
+            planned.push((*spec, agent, prompt, step_index));
+        }
+
+        // A single-step level runs inline; spawning a task for it would add
+        // nothing but a context switch.
+        if planned.len() == 1 {
+            let (spec, agent, prompt, index) = planned.pop().expect("one element");
+            let outcome = runner
+                .run_with_retry(agent, index, spec.title, prompt)
+                .await;
+            let outcome = self.report_failure(outcome, index, spec.title);
+            self.absorb(spec.id, outcome, outputs).await;
+            return Ok(step_index);
+        }
+
+        let mut set = JoinSet::new();
+        for (spec, agent, prompt, index) in planned {
+            let runner = runner.clone();
+            set.spawn(async move {
+                let outcome = runner
+                    .run_with_retry(agent, index, spec.title, prompt)
+                    .await;
+                (spec, index, outcome)
+            });
+        }
+
+        let mut results = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            results.push(joined.context("Step task panicked")?);
+        }
+        // Absorb in step order, so the record does not depend on which task
+        // happened to finish first.
+        results.sort_by_key(|(_, index, _)| *index);
+
+        for (spec, index, outcome) in results {
+            let outcome = self.report_failure(outcome, index, spec.title);
+            self.absorb(spec.id, outcome, outputs).await;
+        }
+
+        Ok(step_index)
+    }
+
+    fn report_failure(
+        &self,
+        outcome: Result<StepOutcome>,
+        step_index: usize,
+        title: &str,
+    ) -> Result<StepOutcome> {
+        if let Err(e) = &outcome {
+            if !self.cancel_token.is_cancelled() {
+                self.emit(OrchestratorEvent::SystemLog {
+                    level: "ERROR".to_string(),
+                    target: "Orchestrator".to_string(),
+                    message: format!("Step {step_index} '{title}' failed: {e:#}"),
+                    timestamp: Utc::now(),
+                });
+            }
+        }
+        outcome
+    }
+
+    /// Record a completed step: agent state, outputs, tokens, shared memory.
+    ///
+    /// A failed step becomes a marker rather than an abort, so one bad agent
+    /// degrades the deliverable instead of ending the workflow.
+    async fn absorb(
+        &mut self,
+        step_id: &str,
+        outcome: Result<StepOutcome>,
+        outputs: &mut HashMap<String, String>,
+    ) {
+        let output = match outcome {
+            Ok(o) => {
+                let agent_id = o.agent.config.id.clone();
+                self.total_tokens += o.tokens;
+                *self.agent_token_totals.entry(agent_id.clone()).or_insert(0) += o.tokens;
+
+                self.emit(OrchestratorEvent::MetricsTick {
+                    agent_id: agent_id.clone(),
+                    ttft_ms: None,
+                    current_tps: 0.0,
+                    avg_tps: 0.0,
+                    total_tokens: self.agent_token_totals[&agent_id],
+                    timestamp: Utc::now(),
+                });
+
+                self.agents.insert(agent_id, o.agent);
+                o.output
+            }
+            Err(e) => format!(
+                "[Step '{step_id}' did not complete: {e:#}. Continuing with available context.]"
+            ),
+        };
+
+        self.blackboard.set(step_id, &output).await;
+        outputs.insert(step_id.to_string(), output.clone());
+        self.step_outputs.push((step_id.to_string(), output));
+    }
+
+    /// Revise and re-review while the verdict is a failure.
+    async fn run_review_loop(
+        &mut self,
+        review: ReviewLoop,
+        user_goal: &str,
+        outputs: &mut HashMap<String, String>,
+        mut step_index: usize,
+    ) -> Result<usize> {
+        for round in 1..=review.max_rounds {
+            self.check_cancelled()?;
+
+            let verdict = outputs
+                .get(review.verdict_step)
+                .map(|t| Verdict::parse(t))
+                .unwrap_or(Verdict::Pass);
+            if verdict == Verdict::Pass {
+                break;
+            }
+
+            self.emit(OrchestratorEvent::SystemLog {
+                level: "INFO".to_string(),
+                target: "Orchestrator".to_string(),
+                message: format!(
+                    "Review reported problems — revision round {round} of {}.",
+                    review.max_rounds
+                ),
+                timestamp: Utc::now(),
+            });
+
+            let runner = self.runner();
+
+            step_index += 1;
+            let agent = self
+                .agents
+                .get(review.revise_agent)
+                .with_context(|| format!("Unknown revise agent '{}'", review.revise_agent))?
+                .clone();
+            let prompt = self.build_prompt(
+                review.revise_instruction,
+                &[review.revises_step, review.verdict_step],
+                user_goal,
+                outputs,
+                &agent,
+            );
+            let outcome = runner
+                .run_with_retry(agent, step_index, review.revise_title, prompt)
+                .await;
+            let outcome = self.report_failure(outcome, step_index, review.revise_title);
+            let revision_failed = outcome.is_err();
+            self.absorb(review.revises_step, outcome, outputs).await;
+            if revision_failed {
+                break;
+            }
+
+            step_index += 1;
+            let spec = *self
+                .topology
+                .steps()
+                .iter()
+                .find(|s| s.id == review.verdict_step)
+                .context("Review loop names a step that is not in the graph")?;
+            let agent = self
+                .agents
+                .get(spec.agent_id)
+                .with_context(|| format!("Unknown review agent '{}'", spec.agent_id))?
+                .clone();
+            let prompt = self.build_prompt(
+                spec.instruction,
+                spec.depends_on,
+                user_goal,
+                outputs,
+                &agent,
+            );
+            let outcome = runner
+                .run_with_retry(agent, step_index, spec.title, prompt)
+                .await;
+            let outcome = self.report_failure(outcome, step_index, spec.title);
+            let review_failed = outcome.is_err();
+            self.absorb(spec.id, outcome, outputs).await;
+            if review_failed {
+                break;
+            }
+        }
+
+        Ok(step_index)
+    }
+
+    /// Assemble a prompt from the goal, this step's dependencies, and its
+    /// instruction — fitted to the context window.
+    fn build_prompt(
+        &self,
+        instruction: &str,
+        depends_on: &[&str],
+        user_goal: &str,
+        outputs: &HashMap<String, String>,
+        agent: &Agent,
+    ) -> String {
+        let mut sections = vec![Section::essential("Goal", user_goal)];
+
+        // Later dependencies are the more immediate context, so they outrank
+        // earlier ones when space runs short.
+        for (position, dep) in depends_on.iter().enumerate() {
+            if let Some(body) = outputs.get(*dep) {
+                sections.push(Section::new(
+                    label_for(dep),
+                    body.clone(),
+                    (ARTIFACT_PRIORITY as usize + position).min(200) as u8,
+                ));
+            }
+        }
+        sections.push(Section::essential("Your task", instruction));
+
+        // The system prompt and any accumulated history occupy the window too.
+        let history: usize = agent
+            .history
+            .iter()
+            .map(|m| estimate_tokens(&m.content))
+            .sum();
+        let budget = self
+            .runner()
+            .prompt_budget(agent.config.max_tokens)
+            .saturating_sub(history)
+            .max(512);
+
+        let fitted = fit(&sections, budget);
+        if !fitted.trimmed.is_empty() {
+            self.emit(OrchestratorEvent::SystemLog {
+                level: "WARN".to_string(),
+                target: "Orchestrator".to_string(),
+                message: format!(
+                    "Context budget reached; shortened {} to fit {} tokens.",
+                    fitted.trimmed.join(", "),
+                    self.context_tokens
+                ),
+                timestamp: Utc::now(),
+            });
+        }
+
+        fitted.text
+    }
+
     fn check_cancelled(&self) -> Result<()> {
         if self.cancel_token.is_cancelled() {
             self.emit(OrchestratorEvent::WorkflowCancelled {
@@ -198,706 +936,174 @@ impl Orchestrator {
         }
         Ok(())
     }
+}
 
-    /// Run the multi-agent workflow for the given user prompt
-    pub async fn execute_goal(&mut self, user_goal: &str) -> Result<String> {
-        let start_time = Instant::now();
-        self.workflow_start = Some(start_time);
-        self.total_tokens = 0;
-        self.agent_token_totals.clear();
-        self.blackboard.clear().await;
-        self.blackboard.set("user_goal", user_goal).await;
-
-        self.emit(OrchestratorEvent::SystemLog {
-            level: "INFO".to_string(),
-            target: "Orchestrator".to_string(),
-            message: format!(
-                "Starting workflow ({}) with goal: {}",
-                self.topology.name(),
-                user_goal
-            ),
-            timestamp: Utc::now(),
-        });
-
-        let final_result = match self.topology {
-            TopologyMode::Hierarchical => self.run_hierarchical_swarm(user_goal).await?,
-            TopologyMode::AssemblyLine => self.run_assembly_line(user_goal).await?,
-            TopologyMode::DebateReview => self.run_debate_review(user_goal).await?,
-            TopologyMode::DirectCoder => self.run_direct_coder(user_goal).await?,
-        };
-
-        let total_duration_ms = start_time.elapsed().as_millis() as u64;
-
-        self.emit(OrchestratorEvent::WorkflowOverallCompleted {
-            topology: self.topology.name().to_string(),
-            total_duration_ms,
-            total_tokens: self.total_tokens,
-            summary: final_result.clone(),
-            timestamp: Utc::now(),
-        });
-
-        Ok(final_result)
+fn label_for(step_id: &str) -> String {
+    let mut chars = step_id.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => step_id.to_string(),
     }
+}
 
-    /// Run a single agent step, retrying a failed attempt up to twice.
+/// A critic's judgement on the work it reviewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Pass,
+    Fail,
+}
+
+impl Verdict {
+    /// Read `VERDICT: PASS` / `VERDICT: FAIL` from a review.
     ///
-    /// A step that exhausts its retries returns `Ok` with a marker string rather
-    /// than an error: one flaky agent should degrade the deliverable, not abort
-    /// the whole workflow. Cancellation is the exception and propagates at once.
-    async fn run_agent_step_with_retry(
-        &mut self,
-        agent_id: &str,
-        step_index: usize,
-        step_title: &str,
-        prompt: &str,
-    ) -> Result<String> {
-        let max_retries = 2;
-        let mut last_error = None;
+    /// Absent or unreadable, this returns `Pass`. A small model that will not
+    /// follow the format should not be able to trigger revision rounds it never
+    /// asked for; failing to loop is cheaper than looping for no reason.
+    pub fn parse(text: &str) -> Self {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE
+            .get_or_init(|| Regex::new(r"(?i)verdict[\s*:_\-]*(pass|fail)").expect("valid regex"));
 
-        for attempt in 0..=max_retries {
-            self.check_cancelled()?;
-
-            if attempt > 0 {
-                self.emit(OrchestratorEvent::SystemLog {
-                    level: "WARN".to_string(),
-                    target: "Orchestrator".to_string(),
-                    message: format!(
-                        "Retrying step '{}' (attempt {}/{})",
-                        step_title,
-                        attempt + 1,
-                        max_retries + 1
-                    ),
-                    timestamp: Utc::now(),
-                });
-
-                // Brief backoff before retry
-                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
-
-                // Clear the failed attempt from agent history
-                if let Some(agent) = self.agents.get_mut(agent_id) {
-                    agent.clear_history();
-                }
-            }
-
-            match self
-                .run_agent_step(agent_id, step_index, step_title, prompt)
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    // A cancelled workflow must not be retried — the user asked
-                    // it to stop, so burning two more attempts ignores them.
-                    if self.cancel_token.is_cancelled() {
-                        return Err(e);
-                    }
-                    self.emit(OrchestratorEvent::SystemLog {
-                        level: "ERROR".to_string(),
-                        target: "Orchestrator".to_string(),
-                        message: format!(
-                            "Step '{}' failed (attempt {}): {}",
-                            step_title,
-                            attempt + 1,
-                            e
-                        ),
-                        timestamp: Utc::now(),
-                    });
-                    last_error = Some(e);
-                }
-            }
+        match re
+            .captures_iter(text)
+            .last()
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_lowercase())
+        {
+            Some(v) if v == "fail" => Verdict::Fail,
+            _ => Verdict::Pass,
         }
-
-        let err_msg = last_error
-            .map(|e| format!("{}", e))
-            .unwrap_or_else(|| "Unknown error".to_string());
-
-        self.set_agent_status(agent_id, AgentStatus::Error);
-
-        Ok(format!(
-            "[Step '{}' failed after {} attempts: {}. Continuing with available context.]",
-            step_title,
-            max_retries + 1,
-            err_msg
-        ))
     }
+}
 
-    /// Execute one agent step: stream a completion, and service any tool calls
-    /// the agent is actually permitted to make.
-    async fn run_agent_step(
-        &mut self,
-        agent_id: &str,
-        step_index: usize,
-        step_title: &str,
-        prompt: &str,
-    ) -> Result<String> {
-        let step_start_instant = Instant::now();
-        let workflow_offset_ms = self.step_offset_ms();
-        let agent_role = self
-            .agents
-            .get(agent_id)
-            .map(|a| a.config.role.name().to_string())
-            .unwrap_or_default();
+/// Strip reasoning scratchpads and leaked tool-call tags from final output.
+fn clean_agent_output(text: &str) -> String {
+    static THINK: OnceLock<Regex> = OnceLock::new();
+    static TOOL_CALL: OnceLock<Regex> = OnceLock::new();
 
-        self.emit(OrchestratorEvent::WorkflowStepStarted {
-            step_index,
-            total_steps: self.topology.step_count(),
-            title: step_title.to_string(),
-            agent_id: agent_id.to_string(),
-            timestamp: Utc::now(),
-        });
+    let think = THINK.get_or_init(|| Regex::new(r"(?s)<think>.*?</think>").expect("valid regex"));
+    let tool_call = TOOL_CALL
+        .get_or_init(|| Regex::new(r"(?s)<tool_call>.*?</tool_call>").expect("valid regex"));
 
-        self.set_agent_status(agent_id, AgentStatus::Thinking);
+    let stripped = think.replace_all(text, "");
+    let stripped = tool_call.replace_all(&stripped, "");
 
-        let enabled_tools = self
-            .agents
-            .get(agent_id)
-            .map(|a| a.config.enabled_tools.clone())
-            .unwrap_or_default();
+    // Every closed pair is gone, so a surviving `<think>` was never closed —
+    // which happens when the repetition guard cuts a stream mid-reasoning.
+    // Everything from there on is scratchpad, not output. Done with string
+    // search rather than a regex: `regex` has no look-around.
+    let body = match stripped.find("<think>") {
+        Some(idx) => &stripped[..idx],
+        None => &stripped,
+    };
+    body.trim().to_string()
+}
 
-        // An agent with no tools gets exactly one pass. Previously every agent
-        // ran the tool loop and had its output scanned for tool calls, so a
-        // fenced JSON snippet inside the Engineer's own code was parsed as a
-        // call — which executed a tool, fed the result back, and re-prompted for
-        // more code. That was the Engineer loop.
-        let max_iterations = if enabled_tools.is_empty() { 1 } else { 2 };
+/// Extract a tool call from text, for models that describe calls instead of
+/// emitting them through the native protocol.
+fn parse_tool_call(text: &str) -> Option<ToolCall> {
+    static TAGGED: OnceLock<Regex> = OnceLock::new();
+    static FENCED: OnceLock<Regex> = OnceLock::new();
+    static RAW: OnceLock<Regex> = OnceLock::new();
 
-        let mut current_prompt = prompt.to_string();
-        let mut full_agent_response = String::new();
-        let mut tool_calls_count = 0usize;
-        let mut step_tokens = 0usize;
-
-        for _iteration in 0..max_iterations {
-            self.check_cancelled()?;
-
-            let (model, temp, max_tokens) = {
-                let agent = self.agents.get_mut(agent_id).context("Agent not found")?;
-                agent.add_user_message(&current_prompt);
-                (
-                    agent.config.model.clone(),
-                    agent.config.temperature,
-                    agent.config.max_tokens,
-                )
-            };
-
-            let active_tools = self.tools.tools_for(&enabled_tools);
-
-            let messages = {
-                let agent = self.agents.get(agent_id).context("Agent not found")?;
-                agent.history.clone()
-            };
-
-            self.set_agent_status(agent_id, AgentStatus::Streaming);
-
-            let mut stream = self
-                .provider
-                .stream_chat(&model, &messages, temp, max_tokens, &active_tools)
-                .await
-                .with_context(|| format!("Failed to stream chat for agent {}", agent_id))?;
-
-            let mut iteration_response = String::new();
-            let mut native_tool_calls: Vec<ToolCall> = Vec::new();
-            // Second line of defence behind `num_predict`: a provider that
-            // ignores the cap, or a model stuck repeating one block, gets cut
-            // off here instead of running to the HTTP timeout.
-            let mut guard = RepetitionGuard::new(max_tokens);
-            let mut reported_completion_tokens = None;
-            let mut chunk_tokens = 0usize;
-            let mut stop_reason = None;
-
-            while let Some(chunk_res) = stream.next().await {
-                if self.cancel_token.is_cancelled() {
-                    self.check_cancelled()?;
-                }
-
-                match chunk_res {
-                    Ok(chunk) => {
-                        if !chunk.tool_calls.is_empty() {
-                            native_tool_calls.extend(chunk.tool_calls);
-                        }
-                        if chunk.completion_tokens.is_some() {
-                            reported_completion_tokens = chunk.completion_tokens;
-                        }
-
-                        if chunk.delta.is_empty() {
-                            continue;
-                        }
-
-                        if let Some(reason) = guard.push(&chunk.delta) {
-                            stop_reason = Some(reason);
-                        }
-
-                        chunk_tokens += 1;
-                        iteration_response.push_str(&chunk.delta);
-
-                        self.emit(OrchestratorEvent::AgentTokenChunk {
-                            agent_id: agent_id.to_string(),
-                            role: agent_role.clone(),
-                            delta: chunk.delta,
-                            is_thought: chunk.is_thought,
-                            timestamp: Utc::now(),
-                        });
-
-                        if stop_reason.is_some() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        self.set_agent_status(agent_id, AgentStatus::Error);
-                        anyhow::bail!("Stream error in agent {}: {}", agent_id, e);
-                    }
-                }
-            }
-            // Dropping the stream cancels the provider task feeding it, so an
-            // abandoned generation stops costing time on the model server.
-            drop(stream);
-
-            if let Some(reason) = stop_reason {
-                self.emit(OrchestratorEvent::SystemLog {
-                    level: "WARN".to_string(),
-                    target: agent_role.clone(),
-                    message: format!(
-                        "Output cut short after {} chars: {}. Keeping what was generated.",
-                        guard.total_chars(),
-                        reason.as_str()
-                    ),
-                    timestamp: Utc::now(),
-                });
-            }
-
-            // Chunk counts are an estimate; a provider that reports its own
-            // usage is authoritative, so reconcile before the step ends.
-            let actual_tokens = reported_completion_tokens.unwrap_or(chunk_tokens);
-            step_tokens += actual_tokens;
-            self.total_tokens += actual_tokens;
-
-            let agent_total = self
-                .agent_token_totals
-                .entry(agent_id.to_string())
-                .or_insert(0);
-            *agent_total += actual_tokens;
-            let agent_total = *agent_total;
-
-            self.emit(OrchestratorEvent::MetricsTick {
-                agent_id: agent_id.to_string(),
-                ttft_ms: None,
-                current_tps: 0.0,
-                avg_tps: 0.0,
-                total_tokens: agent_total,
-                timestamp: Utc::now(),
-            });
-
-            full_agent_response.push_str(&iteration_response);
-            full_agent_response.push('\n');
-
-            if let Some(agent) = self.agents.get_mut(agent_id) {
-                agent.add_assistant_message(&iteration_response);
-            }
-
-            // Only agents holding tools may call them, and only tools on their
-            // own allow-list. Anything else in the text is prose, not a call.
-            let Some((tool_name, tool_args)) =
-                self.resolve_tool_call(&native_tool_calls, &iteration_response, &enabled_tools)
-            else {
-                break;
-            };
-
-            tool_calls_count += 1;
-            self.set_agent_status(agent_id, AgentStatus::CallingTool);
-
-            let call_id = uuid::Uuid::new_v4().to_string();
-            let tool_start = Instant::now();
-
-            self.emit(OrchestratorEvent::ToolCallStarted {
-                agent_id: agent_id.to_string(),
-                tool_name: tool_name.clone(),
-                args: truncate_chars(&tool_args.to_string(), 2000),
-                call_id: call_id.clone(),
-                timestamp: Utc::now(),
-            });
-
-            let tool_res = self.tools.execute(&tool_name, tool_args).await;
-            let duration_ms = tool_start.elapsed().as_millis() as u64;
-
-            let (result_str, is_err) = match tool_res {
-                Ok(out) => (out, false),
-                Err(e) => (format!("Tool execution error: {}", e), true),
-            };
-
-            self.emit(OrchestratorEvent::ToolCallFinished {
-                agent_id: agent_id.to_string(),
-                tool_name: tool_name.clone(),
-                call_id,
-                result: result_str.clone(),
-                is_error: is_err,
-                duration_ms,
-                timestamp: Utc::now(),
-            });
-
-            if let Some(agent) = self.agents.get_mut(agent_id) {
-                agent.add_tool_result(&result_str, &tool_name);
-            }
-
-            current_prompt = if is_err {
-                format!(
-                    "Tool '{}' failed: {}\n\nProceed with your task using the context you already have. Write your final response now.",
-                    tool_name, result_str
-                )
-            } else {
-                format!(
-                    "Tool '{}' returned:\n{}\n\nUse this result to write your final response now. Do NOT call more tools unless absolutely necessary.",
-                    tool_name, result_str
-                )
-            };
+    // 1. <tool_call> XML tags, used by Qwen, DeepSeek and Llama.
+    let tagged = TAGGED.get_or_init(|| {
+        Regex::new(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>").expect("valid regex")
+    });
+    for cap in tagged.captures_iter(text) {
+        if let Some(call) = cap.get(1).and_then(|m| call_from_json(m.as_str())) {
+            return Some(call);
         }
-
-        self.set_agent_status(agent_id, AgentStatus::Done);
-
-        let cleaned_output = self.clean_agent_output(&full_agent_response);
-        let duration_ms = step_start_instant.elapsed().as_millis() as u64;
-
-        self.emit(OrchestratorEvent::WorkflowStepFinished {
-            step_index,
-            title: step_title.to_string(),
-            agent_id: agent_id.to_string(),
-            duration_ms,
-            start_offset_ms: workflow_offset_ms,
-            tokens: step_tokens,
-            tool_calls: tool_calls_count,
-            success: true,
-            output_preview: preview_line(&cleaned_output, 160),
-            timestamp: Utc::now(),
-        });
-
-        Ok(if cleaned_output.is_empty() {
-            full_agent_response.trim().to_string()
-        } else {
-            cleaned_output
-        })
     }
 
-    /// Milliseconds from the start of the workflow, for waterfall placement.
-    fn step_offset_ms(&self) -> u64 {
-        self.workflow_start
-            .map(|start| start.elapsed().as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    /// Decide whether this step ends in a tool call.
-    ///
-    /// Native calls from the provider are trusted first; otherwise the text is
-    /// scraped. Either way the name must appear in `enabled_tools`, so an agent
-    /// cannot reach a tool it was not given — and prose that merely looks like
-    /// a call cannot become one.
-    fn resolve_tool_call(
-        &self,
-        native: &[ToolCall],
-        text: &str,
-        enabled_tools: &[String],
-    ) -> Option<(String, serde_json::Value)> {
-        if enabled_tools.is_empty() {
-            return None;
+    // 2. An explicitly tagged ```json block. Only `json` — matching any fence
+    //    would treat a Rust or Python sample as a call.
+    let fenced =
+        FENCED.get_or_init(|| Regex::new(r"```json\s*(\{[\s\S]*?\})\s*```").expect("valid regex"));
+    for cap in fenced.captures_iter(text) {
+        if let Some(call) = cap.get(1).and_then(|m| call_from_json(m.as_str())) {
+            return Some(call);
         }
-
-        let candidate = native
-            .first()
-            .map(|tc| (tc.name.clone(), tc.arguments.clone()))
-            .or_else(|| self.parse_tool_call(text))?;
-
-        if !enabled_tools.contains(&candidate.0) {
-            self.emit(OrchestratorEvent::SystemLog {
-                level: "WARN".to_string(),
-                target: "Orchestrator".to_string(),
-                message: format!(
-                    "Ignoring call to '{}': not in this agent's enabled tools.",
-                    candidate.0
-                ),
-                timestamp: Utc::now(),
-            });
-            return None;
-        }
-
-        Some(candidate)
     }
 
-    /// Clean reasoning scratchpad tags (<think>...</think>) or leaked XML tool call tags from final output
-    fn clean_agent_output(&self, text: &str) -> String {
-        static THINK: OnceLock<Regex> = OnceLock::new();
-        static TOOL_CALL: OnceLock<Regex> = OnceLock::new();
-
-        let think =
-            THINK.get_or_init(|| Regex::new(r"(?s)<think>.*?</think>").expect("valid regex"));
-        let tool_call = TOOL_CALL
-            .get_or_init(|| Regex::new(r"(?s)<tool_call>.*?</tool_call>").expect("valid regex"));
-
-        let stripped = think.replace_all(text, "");
-        let stripped = tool_call.replace_all(&stripped, "");
-
-        // Every closed pair is gone, so a surviving `<think>` was never closed —
-        // which happens when the repetition guard cuts a stream mid-reasoning.
-        // Everything from there on is scratchpad, not output. Done with string
-        // search rather than a regex: `regex` has no look-around.
-        let body = match stripped.find("<think>") {
-            Some(idx) => &stripped[..idx],
-            None => &stripped,
-        };
-        body.trim().to_string()
+    // 3. A bare {"name": ..., "arguments": {...}} object.
+    let raw = RAW.get_or_init(|| {
+        Regex::new(r#"\{\s*"(?:tool|name)"\s*:\s*"([^"]+)"\s*,\s*"(?:arguments|parameters)"\s*:\s*(\{[\s\S]*?\})\s*\}"#)
+            .expect("valid regex")
+    });
+    if let Some(cap) = raw.captures(text) {
+        let name = cap.get(1)?.as_str().to_string();
+        let args = serde_json::from_str(cap.get(2)?.as_str()).ok()?;
+        return Some(ToolCall::new(name, args));
     }
 
-    /// Extract JSON tool invocation formatted as <tool_call>...</tool_call>, ```json ... ``` or {"tool"/"name": "...", "arguments": { ... }}
-    fn parse_tool_call(&self, text: &str) -> Option<(String, serde_json::Value)> {
-        // 1. Check for <tool_call> XML tags (used by Qwen, DeepSeek, and Llama)
-        if let Ok(tool_call_tag_re) = Regex::new(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>") {
-            for cap in tool_call_tag_re.captures_iter(text) {
-                if let Some(matched) = cap.get(1) {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(matched.as_str()) {
-                        let tool_name = val
-                            .get("name")
-                            .or_else(|| val.get("tool"))
-                            .and_then(|t| t.as_str());
-                        if let Some(name) = tool_name {
-                            let args = val
-                                .get("arguments")
-                                .or_else(|| val.get("parameters"))
-                                .cloned()
-                                .unwrap_or(serde_json::json!({}));
-                            return Some((name.to_string(), args));
-                        }
-                    }
-                }
-            }
-        }
+    None
+}
 
-        // 2. Check for markdown codeblock: ```json {"tool"/"name": "...", "arguments": {...}} ```
-        // IMPORTANT: Only match explicit ```json blocks to avoid matching ```rust/```python code examples
-        if let Ok(json_codeblock_re) = Regex::new(r"```json\s*(\{[\s\S]*?\})\s*```") {
-            for cap in json_codeblock_re.captures_iter(text) {
-                if let Some(matched) = cap.get(1) {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(matched.as_str()) {
-                        let tool_name = val
-                            .get("tool")
-                            .or_else(|| val.get("name"))
-                            .and_then(|t| t.as_str());
-                        if let Some(name) = tool_name {
-                            let args = val
-                                .get("arguments")
-                                .or_else(|| val.get("parameters"))
-                                .cloned()
-                                .unwrap_or(serde_json::json!({}));
-                            return Some((name.to_string(), args));
-                        }
-                    }
-                }
-            }
-        }
+fn call_from_json(raw: &str) -> Option<ToolCall> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let name = value
+        .get("name")
+        .or_else(|| value.get("tool"))
+        .and_then(|t| t.as_str())?;
+    let args = value
+        .get("arguments")
+        .or_else(|| value.get("parameters"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some(ToolCall::new(name, args))
+}
 
-        // 3. Try raw JSON regex: {"name" / "tool": "...", "arguments": {...}}
-        if let Ok(raw_json_re) = Regex::new(
-            r#"\{\s*"(?:tool|name)"\s*:\s*"([^"]+)"\s*,\s*"(?:arguments|parameters)"\s*:\s*(\{[\s\S]*?\})\s*\}"#,
-        ) {
-            if let Some(cap) = raw_json_re.captures(text) {
-                let tool_name = cap.get(1)?.as_str().to_string();
-                let args_str = cap.get(2)?.as_str();
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
-                    return Some((tool_name, args));
-                }
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        None
+    #[test]
+    fn verdict_defaults_to_pass_when_unstated() {
+        assert_eq!(Verdict::parse("The code looks reasonable."), Verdict::Pass);
+        assert_eq!(Verdict::parse(""), Verdict::Pass);
     }
 
-    #[cfg(test)]
-    pub fn clean_agent_output_for_test(&self, text: &str) -> String {
-        self.clean_agent_output(text)
+    #[test]
+    fn verdict_reads_the_declared_result_in_common_formats() {
+        assert_eq!(Verdict::parse("VERDICT: FAIL"), Verdict::Fail);
+        assert_eq!(Verdict::parse("verdict - fail"), Verdict::Fail);
+        assert_eq!(Verdict::parse("**Verdict:** **FAIL**"), Verdict::Fail);
+        assert_eq!(Verdict::parse("Verdict: PASS"), Verdict::Pass);
     }
 
-    /// Test-only view of the tool-call gate, which is the fix for the
-    /// Engineer's runaway loop and worth asserting on directly.
-    #[cfg(test)]
-    pub fn resolve_tool_call_for_test(
-        &self,
-        native: &[ToolCall],
-        text: &str,
-        enabled_tools: &[String],
-    ) -> Option<(String, serde_json::Value)> {
-        self.resolve_tool_call(native, text, enabled_tools)
+    #[test]
+    fn the_last_verdict_wins_when_a_review_restates_itself() {
+        // Models often narrate a provisional verdict before settling.
+        let review = "Initially VERDICT: FAIL\n...after the fix...\nVERDICT: PASS";
+        assert_eq!(Verdict::parse(review), Verdict::Pass);
     }
 
-    /// Topology 1: Hierarchical Swarm (Researcher -> Planner -> Engineer -> Critic -> Synthesizer)
-    async fn run_hierarchical_swarm(&mut self, user_goal: &str) -> Result<String> {
-        // Step 1: Research and context exploration
-        let research_prompt = format!(
-            "User Goal: {}\n\nInvestigate relevant project files, directory structure, schemas, APIs, and technical requirements needed to achieve this goal. Gather factual context and detail any constraints.",
-            user_goal
+    #[test]
+    fn tool_calls_are_parsed_from_each_supported_text_form() {
+        let tagged =
+            r#"<tool_call>{"name": "read_file", "arguments": {"path": "a.rs"}}</tool_call>"#;
+        assert_eq!(parse_tool_call(tagged).unwrap().name, "read_file");
+
+        let fenced =
+            "```json\n{\"tool\": \"calculator\", \"arguments\": {\"expression\": \"2+2\"}}\n```";
+        assert_eq!(parse_tool_call(fenced).unwrap().name, "calculator");
+
+        let raw = r#"call this: {"name": "web_fetch", "parameters": {"url": "https://x.test"}}"#;
+        assert_eq!(parse_tool_call(raw).unwrap().name, "web_fetch");
+    }
+
+    #[test]
+    fn cleaning_strips_reasoning_and_leaked_tags() {
+        assert_eq!(clean_agent_output("<think>hmm</think>answer"), "answer");
+        assert_eq!(clean_agent_output("answer\n<think>cut off mid"), "answer");
+        assert_eq!(
+            clean_agent_output(r#"<tool_call>{"name":"x"}</tool_call>body"#),
+            "body"
         );
-        let research = self
-            .run_agent_step_with_retry(
-                "researcher",
-                1,
-                "Context Exploration & Fact Scouting",
-                &research_prompt,
-            )
-            .await?;
-        self.blackboard.set("research", &research).await;
-
-        // Step 2: Strategic planning based on research findings
-        let plan_prompt = format!(
-            "Goal: {}\n\nContext & Research Findings:\n{}\n\nBased on the research findings and goal, design a high-precision architectural blueprint, implementation roadmap, module boundaries, data structures, and edge-case handling strategy.",
-            user_goal, research
+        assert_eq!(
+            clean_agent_output("<think>x</think>résultat 🛡️"),
+            "résultat 🛡️"
         );
-        let plan = self
-            .run_agent_step_with_retry("planner", 2, "Architectural Blueprint & Plan", &plan_prompt)
-            .await?;
-        self.blackboard.set("plan", &plan).await;
-
-        // Step 3: Core engineering implementation
-        let coder_prompt = format!(
-            "Goal: {}\n\nResearch Context:\n{}\n\nArchitectural Blueprint:\n{}\n\nWrite the complete, high-performance, robust, and clean implementation code with full explanations, error handling, and unit tests.",
-            user_goal, research, plan
-        );
-        let code = self
-            .run_agent_step_with_retry("coder", 3, "Core Engineering Implementation", &coder_prompt)
-            .await?;
-        self.blackboard.set("code", &code).await;
-
-        // Step 4: Security and rigor code audit
-        let critic_prompt = format!(
-            "Goal: {}\n\nArchitectural Plan:\n{}\n\nEngineered Implementation:\n{}\n\nRigorously review the code for correctness, security vulnerabilities, edge cases, algorithmic time/space complexity, and memory safety. Provide actionable fixes.",
-            user_goal, plan, code
-        );
-        let critique = self
-            .run_agent_step_with_retry("critic", 4, "Security & Performance Review", &critic_prompt)
-            .await?;
-        self.blackboard.set("critique", &critique).await;
-
-        // Step 5: Final synthesis and delivery
-        let synth_prompt = format!(
-            "User Goal: {}\n\nResearch Findings:\n{}\n\nArchitectural Plan:\n{}\n\nImplementation:\n{}\n\nCritic Review & Recommendations:\n{}\n\nSynthesize this into the final, definitive, production-ready deliverable with all polished artifacts, documentation, and recommendations.",
-            user_goal, research, plan, code, critique
-        );
-        let final_output = self
-            .run_agent_step_with_retry(
-                "synthesizer",
-                5,
-                "Executive Synthesis & Finalization",
-                &synth_prompt,
-            )
-            .await?;
-
-        Ok(final_output)
-    }
-
-    /// Topology 2: Assembly Line (Sequential Pipeline: Researcher -> Planner -> Engineer -> Critic -> Synthesizer)
-    async fn run_assembly_line(&mut self, user_goal: &str) -> Result<String> {
-        let research = self
-            .run_agent_step_with_retry(
-                "researcher",
-                1,
-                "Context Scouting Phase",
-                &format!(
-                    "Explore and gather necessary details and context for: {}",
-                    user_goal
-                ),
-            )
-            .await?;
-        let plan = self
-            .run_agent_step_with_retry(
-                "planner",
-                2,
-                "Architectural Planning Phase",
-                &format!(
-                    "Create a step-by-step roadmap based on research:\n{}",
-                    research
-                ),
-            )
-            .await?;
-        let code = self
-            .run_agent_step_with_retry(
-                "coder",
-                3,
-                "Engineering Phase",
-                &format!(
-                    "Implement the solution based on:\nPlan:\n{}\nResearch:\n{}",
-                    plan, research
-                ),
-            )
-            .await?;
-        let critique = self
-            .run_agent_step_with_retry(
-                "critic",
-                4,
-                "Review & Audit Phase",
-                &format!(
-                    "Audit this code for bugs, edge cases, and safety:\n{}",
-                    code
-                ),
-            )
-            .await?;
-        let synth = self
-            .run_agent_step_with_retry(
-                "synthesizer",
-                5,
-                "Final Assembly Phase",
-                &format!(
-                    "Produce final output incorporating critique:\nCode:\n{}\nCritique:\n{}",
-                    code, critique
-                ),
-            )
-            .await?;
-        Ok(synth)
-    }
-
-    /// Topology 3: Peer Review & Debate Loop
-    async fn run_debate_review(&mut self, user_goal: &str) -> Result<String> {
-        let research = self
-            .run_agent_step_with_retry(
-                "researcher",
-                1,
-                "Context Exploration",
-                &format!("Explore context and constraints for: {}", user_goal),
-            )
-            .await?;
-        let initial_solution = self
-            .run_agent_step_with_retry(
-                "coder",
-                2,
-                "Initial Engineering Draft",
-                &format!(
-                    "Draft a complete solution for: {}\nContext:\n{}",
-                    user_goal, research
-                ),
-            )
-            .await?;
-        let critique = self
-            .run_agent_step_with_retry(
-                "critic",
-                3,
-                "Rigor Review & Stress Test",
-                &format!(
-                    "Stress test and critique this solution:\n{}",
-                    initial_solution
-                ),
-            )
-            .await?;
-        let refined_solution = self.run_agent_step_with_retry("coder", 4, "Refined Implementation", &format!("Refine your solution by directly addressing each critique point:\nCritique:\n{}", critique)).await?;
-        let final_synth = self
-            .run_agent_step_with_retry(
-                "synthesizer",
-                5,
-                "Final Synthesis",
-                &format!(
-                    "Synthesize the final peer-reviewed solution:\n{}",
-                    refined_solution
-                ),
-            )
-            .await?;
-        Ok(final_synth)
-    }
-
-    /// Topology 4: Direct Engineer
-    async fn run_direct_coder(&mut self, user_goal: &str) -> Result<String> {
-        let code = self
-            .run_agent_step_with_retry("coder", 1, "Direct Execution", user_goal)
-            .await?;
-        Ok(code)
     }
 }

@@ -42,6 +42,7 @@ pub fn render_app_ui(f: &mut Frame, app: &App) {
         InputMode::ModelSelectModal => render_model_modal(f, size, app),
         InputMode::TopologySelectModal => render_topology_modal(f, size, app),
         InputMode::HelpModal => render_help_modal(f, size),
+        InputMode::PromptEditor => render_prompt_editor(f, size, app),
         _ => {}
     }
 }
@@ -242,6 +243,10 @@ fn render_agents_config_tab(f: &mut Frame, area: Rect, app: &App) {
             Style::default()
                 .fg(sel_agent.config.role.default_color())
                 .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            " [e] edit prompt · [m] change model · [←/→] select agent ",
+            Style::default().fg(Color::DarkGray),
         ));
 
     let tools_str = if sel_agent.config.enabled_tools.is_empty() {
@@ -318,6 +323,10 @@ fn render_blackboard_and_logs_tab(f: &mut Frame, area: Rect, app: &App) {
             Style::default()
                 .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            format!(" files written to {} ", app.workspace.display()),
+            Style::default().fg(Color::DarkGray),
         ));
 
     let mut blackboard_lines = vec![
@@ -424,6 +433,7 @@ fn render_input_bar(f: &mut Frame, area: Rect, app: &App) {
 
     let (mode_badge, mode_color) = match app.input_mode {
         InputMode::EditingPrompt => (" [INPUT] ", Color::Yellow),
+        InputMode::PromptEditor => (" [EDIT] ", Color::Yellow),
         _ => (" [NORMAL] ", Color::Cyan),
     };
 
@@ -670,6 +680,73 @@ fn render_topology_modal(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(List::new(items).block(block), popup_area);
 }
 
+/// Full-height editor for the selected agent's system prompt.
+fn render_prompt_editor(f: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(78, 82, area);
+    f.render_widget(Clear, popup);
+
+    let agents = app.ordered_agents();
+    let name = agents
+        .get(app.selected_agent_idx)
+        .map(|a| a.config.name.as_str())
+        .unwrap_or("agent");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            format!(" Editing system prompt · {name} "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            format!(
+                " Ctrl+S save to {} · Esc cancel ",
+                app.roster_path.display()
+            ),
+            Style::default().fg(Color::DarkGray),
+        ));
+
+    let inner_height = popup.height.saturating_sub(2) as usize;
+    let lines: Vec<&str> = app.prompt_editor.split('\n').collect();
+
+    // Cursor's line and column, so the view can follow it.
+    let mut remaining = app.prompt_editor_cursor;
+    let (mut cursor_line, mut cursor_col) = (0usize, 0usize);
+    for (idx, line) in lines.iter().enumerate() {
+        let len = line.chars().count();
+        if remaining <= len {
+            cursor_line = idx;
+            cursor_col = remaining;
+            break;
+        }
+        remaining -= len + 1; // the newline itself
+        cursor_line = idx + 1;
+    }
+
+    let scroll = cursor_line.saturating_sub(inner_height.saturating_sub(1));
+    let body: Vec<Line> = lines
+        .iter()
+        .map(|l| {
+            Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(Color::White),
+            ))
+        })
+        .collect();
+
+    f.render_widget(
+        Paragraph::new(body).block(block).scroll((scroll as u16, 0)),
+        popup,
+    );
+
+    f.set_cursor_position((
+        popup.x + 1 + cursor_col as u16,
+        popup.y + 1 + (cursor_line - scroll) as u16,
+    ));
+}
+
 fn render_help_modal(f: &mut Frame, area: Rect) {
     let popup_area = centered_rect(64, 72, area);
     f.render_widget(Clear, popup_area);
@@ -726,8 +803,11 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         row("t", "Choose the swarm topology"),
         row("m", "Change the model (per-agent on the Roster tab)"),
         row("c", "Clear the transcript"),
+        row("s", "Export this run as Markdown"),
+        row("e", "Edit the selected agent's prompt (Roster tab)"),
         Line::from(""),
-        section("Editing the prompt"),
+        section("Editing text"),
+        row("Ctrl+S", "Save an edited agent prompt to the roster file"),
         row("Ctrl+W", "Delete the previous word"),
         row("Ctrl+U", "Delete to the start of the line"),
         row("Home / End", "Jump to start / end of the line"),

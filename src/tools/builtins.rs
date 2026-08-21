@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -285,6 +285,10 @@ impl Tool for BashCommandTool {
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command_str);
+        // Cancelling the workflow drops this future; without kill_on_drop the
+        // shell keeps running detached, so Esc would look like it worked while
+        // the command carried on.
+        cmd.kill_on_drop(true);
         cmd.current_dir(&canonical);
 
         let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
@@ -393,8 +397,63 @@ impl Tool for ReadFileTool {
     }
 }
 
-/// Write File Tool
-pub struct WriteFileTool;
+/// Write a file, confined to a workspace directory.
+///
+/// Writes are the one tool action that changes the world outside the process,
+/// so the boundary is structural rather than advisory: every path is resolved
+/// against the workspace root and anything that escapes it is refused. That is
+/// what makes it safe to hand this to an agent at all.
+pub struct WriteFileTool {
+    workspace: PathBuf,
+}
+
+impl WriteFileTool {
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+        }
+    }
+
+    /// Resolve `requested` inside the workspace, refusing anything that escapes.
+    ///
+    /// Resolution is lexical because the target usually does not exist yet, so
+    /// `canonicalize` cannot be used on it. The workspace root itself is
+    /// canonicalised, which collapses any symlink in the prefix.
+    fn resolve(&self, requested: &str) -> Result<PathBuf> {
+        let root = self
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace.clone());
+
+        let candidate = Path::new(requested);
+        let joined = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            root.join(candidate)
+        };
+
+        let mut resolved = PathBuf::new();
+        for part in joined.components() {
+            match part {
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                Component::CurDir => {}
+                other => resolved.push(other.as_os_str()),
+            }
+        }
+
+        if !resolved.starts_with(&root) {
+            anyhow::bail!(
+                "🛡️ Refusing to write outside the workspace. '{}' resolves to '{}', which is not under '{}'.",
+                requested,
+                resolved.display(),
+                root.display()
+            );
+        }
+        Ok(resolved)
+    }
+}
 
 #[async_trait]
 impl Tool for WriteFileTool {
@@ -403,7 +462,7 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "Write text content to a local file, creating parent directories if needed."
+        "Write text content to a file inside the workspace directory, creating parent directories as needed. Paths are relative to the workspace root."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -412,7 +471,7 @@ impl Tool for WriteFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative or absolute path to the destination file"
+                    "description": "Path relative to the workspace root, e.g. 'src/cache.rs'"
                 },
                 "content": {
                     "type": "string",
@@ -434,21 +493,25 @@ impl Tool for WriteFileTool {
             .and_then(|v| v.as_str())
             .context("Missing 'content' parameter")?;
 
-        let path = Path::new(path_str);
+        tokio::fs::create_dir_all(&self.workspace)
+            .await
+            .with_context(|| format!("Failed to create workspace {}", self.workspace.display()))?;
+
+        let path = self.resolve(path_str)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .with_context(|| format!("Failed to create directories for: {}", path_str))?;
+                .with_context(|| format!("Failed to create directories for: {path_str}"))?;
         }
 
-        tokio::fs::write(path, content)
+        tokio::fs::write(&path, content)
             .await
-            .with_context(|| format!("Failed to write file: {}", path_str))?;
+            .with_context(|| format!("Failed to write file: {}", path.display()))?;
 
         Ok(format!(
-            "Successfully wrote {} bytes to {}",
+            "Wrote {} bytes to {}",
             content.len(),
-            path_str
+            path.display()
         ))
     }
 }
@@ -569,11 +632,11 @@ impl Tool for CalculatorTool {
     }
 }
 
-/// Helper function to register all built-in tools into a registry
-pub fn register_builtin_tools(registry: &mut ToolRegistry) {
+/// Register the built-in tools. `workspace` bounds every file write.
+pub fn register_builtin_tools(registry: &mut ToolRegistry, workspace: impl Into<PathBuf>) {
     registry.register(Arc::new(BashCommandTool));
     registry.register(Arc::new(ReadFileTool));
-    registry.register(Arc::new(WriteFileTool));
+    registry.register(Arc::new(WriteFileTool::new(workspace)));
     registry.register(Arc::new(WebFetchTool::default()));
     registry.register(Arc::new(CalculatorTool));
 }

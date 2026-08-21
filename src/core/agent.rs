@@ -1,5 +1,6 @@
 use crate::core::events::AgentStatus;
 use crate::core::memory::ChatMessage;
+use crate::llm::provider::ToolCall;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +58,13 @@ pub struct AgentConfig {
     pub temperature: f32,
     pub max_tokens: Option<usize>,
     pub enabled_tools: Vec<String>,
+    /// Allow a reasoning-capable model to emit a thinking block for this agent.
+    ///
+    /// Off by default. On a small local model a reasoning pass reliably spends
+    /// the whole token budget deliberating and returns no answer, so this is
+    /// worth enabling only on a model with headroom to do both.
+    #[serde(default)]
+    pub thinking: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -92,12 +100,22 @@ impl Agent {
                 "- After gathering context, write a short structured report with your findings.\n",
                 "- Keep your report under 500 words. Be factual, not speculative.\n",
                 "- If no relevant files exist, say so and describe what you learned from the directory listing.\n",
+                "- Store any substantial finding with `blackboard_write` under a short key, then\n",
+                "  refer to the key. Other agents read it without it filling their prompt.\n",
+                "- Use `consult_agent` to ask a specific teammate one focused question.\n",
                 "- Do NOT write code. Do NOT make architectural decisions. Just gather facts.",
             ).to_string(),
             model,
             temperature: 0.1,
             max_tokens: Some(2048),
-            enabled_tools: vec!["read_file".to_string(), "bash_command".to_string(), "web_fetch".to_string()],
+            thinking: false,
+            enabled_tools: vec![
+                "read_file".to_string(),
+                "bash_command".to_string(),
+                "web_fetch".to_string(),
+                "blackboard_write".to_string(),
+                "consult_agent".to_string(),
+            ],
         })
     }
 
@@ -115,6 +133,10 @@ impl Agent {
                 "- Define: data structures, module layout, public API signatures, and error handling strategy.\n",
                 "- Provide a numbered implementation roadmap (Step 1, Step 2, etc.).\n",
                 "- Identify edge cases and thread-safety requirements.\n",
+                "- Match the complexity of the request. Do NOT add error types, traits, generics\n",
+                "  or abstractions the goal did not ask for. If a function cannot fail, it returns\n",
+                "  a plain value, not a Result. The Engineer implements your blueprint literally,\n",
+                "  so anything you invent becomes code that has to work.\n",
                 "- Do NOT write full implementation code. Only define types, traits, and method signatures.\n",
                 "- Do NOT call any tools. You are a pure reasoning agent.\n",
                 "- Keep your plan concise and actionable — under 800 words.",
@@ -122,6 +144,7 @@ impl Agent {
             model,
             temperature: 0.2,
             max_tokens: Some(2048),
+            thinking: false,
             enabled_tools: vec![],  // NO tools — pure reasoning
         })
     }
@@ -147,6 +170,7 @@ impl Agent {
             model,
             temperature: 0.2,
             max_tokens: Some(4096),
+            thinking: false,
             enabled_tools: vec![],  // NO tools — eliminates the loop entirely
         })
     }
@@ -168,11 +192,17 @@ impl Agent {
                 "- If the code is good, say so and explain why.\n",
                 "- Do NOT call any tools. Review the code as provided.\n",
                 "- Do NOT rewrite the entire implementation. Only suggest targeted fixes.\n",
-                "- Keep your review under 600 words.",
+                "- Keep your review under 600 words.\n",
+                "\n",
+                "END your review with exactly one line:\n",
+                "VERDICT: PASS   (if the code is correct and safe to ship)\n",
+                "VERDICT: FAIL   (if you found any defect that must be fixed first)\n",
+                "This line is read by the orchestrator to decide whether a revision round runs.",
             ).to_string(),
             model,
             temperature: 0.1,
             max_tokens: Some(2048),
+            thinking: false,
             enabled_tools: vec![],  // NO tools — pure review
         })
     }
@@ -184,22 +214,59 @@ impl Agent {
             name: "Executive Synthesizer".to_string(),
             role: AgentRole::Synthesizer,
             system_prompt: concat!(
-                "You are the Executive Synthesizer. Your job is to produce the final deliverable.\n",
+                "You are the Executive Synthesizer. You produce the final deliverable and you\n",
+                "are the only agent that can save it to disk.\n",
                 "\n",
-                "RULES:\n",
-                "- Combine the implementation code and critic's fixes into one final, corrected version.\n",
-                "- Present the complete final code in a single fenced code block.\n",
-                "- Add a brief summary: what was built, key design decisions, how to use it.\n",
-                "- Include build/test instructions if applicable.\n",
-                "- Do NOT call any tools.\n",
-                "- Do NOT add new features beyond what was requested.\n",
-                "- Keep the summary under 300 words. The code should be complete.",
+                "DO THIS FIRST, BEFORE WRITING YOUR REPLY:\n",
+                "Call `write_file` once for every file the deliverable contains, with the complete\n",
+                "final content and a path relative to the workspace (e.g. 'src/cache.rs'). Nothing\n",
+                "you only describe is saved — a file that is not written does not exist.\n",
+                "\n",
+                "THEN:\n",
+                "- Combine the implementation and the critic's fixes into one corrected version.\n",
+                "- Show that same complete code in a fenced code block.\n",
+                "- Add a brief summary: what was built, key decisions, how to build and test it.\n",
+                "- Use `blackboard_read` with no key to list shared artifacts if you need them.\n",
+                "- Do NOT add features beyond what was requested.\n",
+                "- Keep the summary under 300 words. The code must be complete.",
             ).to_string(),
             model,
             temperature: 0.3,
             max_tokens: Some(4096),
-            enabled_tools: vec![],  // NO tools
+            // The only agent allowed to write, and only inside the workspace.
+            // Kept off the Engineer, whose own output is what used to be
+            // misparsed into a tool-call loop.
+            thinking: false,
+            enabled_tools: vec!["write_file".to_string(), "blackboard_read".to_string()],
         })
+    }
+
+    /// The five built-in agents, all on one model.
+    pub fn default_roster(model: &str) -> Vec<Agent> {
+        vec![
+            Agent::researcher(model),
+            Agent::planner(model),
+            Agent::coder(model),
+            Agent::critic(model),
+            Agent::synthesizer(model),
+        ]
+    }
+
+    /// The built-in roster with each role on its designated model.
+    pub fn roster_with_models(
+        researcher: &str,
+        planner: &str,
+        coder: &str,
+        critic: &str,
+        synthesizer: &str,
+    ) -> Vec<Agent> {
+        vec![
+            Agent::researcher(researcher),
+            Agent::planner(planner),
+            Agent::coder(coder),
+            Agent::critic(critic),
+            Agent::synthesizer(synthesizer),
+        ]
     }
 
     pub fn add_user_message(&mut self, text: impl Into<String>) {
@@ -210,8 +277,72 @@ impl Agent {
         self.history.push(ChatMessage::assistant(text));
     }
 
-    pub fn add_tool_result(&mut self, content: impl Into<String>, tool_name: impl Into<String>) {
-        self.history.push(ChatMessage::tool(content, tool_name));
+    /// Record an assistant turn together with the calls it requested.
+    pub fn add_assistant_turn(&mut self, text: impl Into<String>, tool_calls: Vec<ToolCall>) {
+        if tool_calls.is_empty() {
+            self.add_assistant_message(text);
+        } else {
+            self.history
+                .push(ChatMessage::assistant_with_calls(text, tool_calls));
+        }
+    }
+
+    pub fn add_tool_result(
+        &mut self,
+        content: impl Into<String>,
+        tool_name: impl Into<String>,
+        call_id: impl Into<String>,
+    ) {
+        self.history
+            .push(ChatMessage::tool(content, tool_name, call_id));
+    }
+
+    /// Drop the oldest turns until the history fits `budget_tokens`.
+    ///
+    /// The system prompt is always kept — it defines the agent — and trimming
+    /// works backwards from the most recent turn, since recent context matters
+    /// more than the opening of a conversation three goals ago. A `tool`
+    /// message is never left without the assistant turn that requested it,
+    /// which strict providers reject.
+    pub fn trim_history(&mut self, budget_tokens: usize) {
+        use crate::core::text::estimate_tokens;
+
+        let system: Vec<ChatMessage> = self
+            .history
+            .iter()
+            .filter(|m| m.role == crate::core::memory::MessageRole::System)
+            .cloned()
+            .collect();
+        let system_cost: usize = system.iter().map(|m| estimate_tokens(&m.content)).sum();
+
+        let mut kept: Vec<ChatMessage> = Vec::new();
+        let mut used = system_cost;
+
+        for message in self
+            .history
+            .iter()
+            .filter(|m| m.role != crate::core::memory::MessageRole::System)
+            .rev()
+        {
+            let cost = estimate_tokens(&message.content);
+            if used + cost > budget_tokens {
+                break;
+            }
+            used += cost;
+            kept.push(message.clone());
+        }
+        kept.reverse();
+
+        // A leading `tool` message would refer to a call that is no longer in
+        // the transcript, so drop any such orphan from the front.
+        while kept
+            .first()
+            .is_some_and(|m| m.role == crate::core::memory::MessageRole::Tool)
+        {
+            kept.remove(0);
+        }
+
+        self.history = system.into_iter().chain(kept).collect();
     }
 
     pub fn clear_history(&mut self) {

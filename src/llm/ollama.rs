@@ -1,5 +1,5 @@
 use crate::core::memory::ChatMessage;
-use crate::llm::provider::{ChunkStream, LlmProvider, LlmStreamChunk, ToolCall};
+use crate::llm::provider::{ChatOptions, ChunkStream, LlmProvider, LlmStreamChunk, ToolCall};
 use crate::tools::tool::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -15,6 +15,10 @@ use tokio_stream::wrappers::ReceiverStream;
 pub struct OllamaProvider {
     endpoint: String,
     client: Client,
+    /// Sent as `num_ctx`. Ollama defaults this to 4096 regardless of what the
+    /// model supports, and silently truncates anything longer, so it has to be
+    /// set deliberately rather than left to the server.
+    context_length: Option<usize>,
 }
 
 impl OllamaProvider {
@@ -31,7 +35,19 @@ impl OllamaProvider {
             .build()
             .unwrap_or_default();
 
-        Self { endpoint, client }
+        Self {
+            endpoint,
+            client,
+            context_length: None,
+        }
+    }
+
+    /// Set the context window to allocate. Larger windows cost proportionally
+    /// more memory for the KV cache, which is why this is a knob and not a
+    /// hardcoded maximum.
+    pub fn with_context_length(mut self, tokens: Option<usize>) -> Self {
+        self.context_length = tokens;
+        self
     }
 
     /// Build native Ollama tool schema from our Tool trait objects
@@ -78,6 +94,13 @@ struct OllamaTagsResponse {
 #[derive(Deserialize)]
 struct OllamaModelItem {
     name: String,
+    #[serde(default)]
+    details: Option<OllamaModelDetails>,
+}
+
+#[derive(Deserialize)]
+struct OllamaModelDetails {
+    context_length: Option<usize>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -151,12 +174,25 @@ impl LlmProvider for OllamaProvider {
         Ok(names)
     }
 
+    async fn model_context_length(&self, model: &str) -> Option<usize> {
+        let url = format!("{}/api/tags", self.endpoint);
+        let resp = self.client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let tags: OllamaTagsResponse = resp.json().await.ok()?;
+        tags.models
+            .into_iter()
+            .find(|m| m.name == model)
+            .and_then(|m| m.details)
+            .and_then(|d| d.context_length)
+    }
+
     async fn stream_chat(
         &self,
         model: &str,
         messages: &[ChatMessage],
-        temperature: f32,
-        max_tokens: Option<usize>,
+        options: &ChatOptions,
         tools: &[Arc<dyn Tool>],
     ) -> Result<ChunkStream> {
         let url = format!("{}/api/chat", self.endpoint);
@@ -173,34 +209,60 @@ impl LlmProvider for OllamaProvider {
             String::new()
         };
 
-        let mut formatted_messages = Vec::new();
-        for msg in messages {
-            let is_system = msg.role == crate::core::memory::MessageRole::System;
-            let content = if is_system && has_tools {
-                format!("{}{}", msg.content, tools_desc)
-            } else {
-                msg.content.clone()
-            };
-            formatted_messages.push(json!({
-                "role": msg.role.to_string(),
-                "content": content
-            }));
-        }
+        let formatted_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|msg| {
+                let is_system = msg.role == crate::core::memory::MessageRole::System;
+                let content = if is_system && has_tools {
+                    format!("{}{}", msg.content, tools_desc)
+                } else {
+                    msg.content.clone()
+                };
+
+                let mut out = json!({ "role": msg.role.to_string(), "content": content });
+
+                // Ollama takes `arguments` as an object, unlike OpenAI's
+                // JSON-encoded string, and identifies a result by tool name.
+                if !msg.tool_calls.is_empty() {
+                    out["tool_calls"] = json!(msg
+                        .tool_calls
+                        .iter()
+                        .map(|tc| json!({
+                            "function": { "name": tc.name, "arguments": tc.arguments }
+                        }))
+                        .collect::<Vec<_>>());
+                }
+                if let Some(name) = &msg.name {
+                    out["tool_name"] = json!(name);
+                }
+                out
+            })
+            .collect();
 
         // `num_predict` is the generation cap. Ollama defaults it to -1
         // (unbounded), so leaving it unset lets a model that falls into a
         // repetition loop stream until the HTTP timeout fires.
-        let mut options = json!({ "temperature": temperature });
-        if let Some(limit) = max_tokens {
-            options["num_predict"] = json!(limit);
+        let mut model_options = json!({ "temperature": options.temperature });
+        if let Some(limit) = options.max_tokens {
+            model_options["num_predict"] = json!(limit);
+        }
+        if let Some(ctx) = self.context_length {
+            model_options["num_ctx"] = json!(ctx);
         }
 
         let mut body = json!({
             "model": model,
             "messages": formatted_messages,
             "stream": true,
-            "options": options
+            "options": model_options
         });
+
+        // `think: false` is accepted by every model; `think: true` is an error
+        // on one without the capability, so enabling is left to the model's own
+        // default rather than asserted here.
+        if !options.thinking {
+            body["think"] = json!(false);
+        }
 
         if has_tools {
             body["tools"] = json!(Self::build_native_tool_schemas(tools));
@@ -254,10 +316,11 @@ impl LlmProvider for OllamaProvider {
                                                 if let Some(ref name) = func.name {
                                                     let args =
                                                         func.arguments.clone().unwrap_or(json!({}));
-                                                    native_tool_calls.push(ToolCall {
-                                                        name: name.clone(),
-                                                        arguments: args,
-                                                    });
+                                                    // Ollama does not issue call
+                                                    // ids; mint one so results
+                                                    // can be correlated.
+                                                    native_tool_calls
+                                                        .push(ToolCall::new(name.clone(), args));
                                                 }
                                             }
                                         }

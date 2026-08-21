@@ -1,5 +1,5 @@
 use crate::core::memory::ChatMessage;
-use crate::llm::provider::{ChunkStream, LlmProvider, LlmStreamChunk, ToolCall};
+use crate::llm::provider::{ChatOptions, ChunkStream, LlmProvider, LlmStreamChunk, ToolCall};
 use crate::tools::tool::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -47,6 +47,50 @@ impl OpenAiCompatProvider {
     }
 }
 
+/// Serialise history to the OpenAI chat schema.
+///
+/// The two extra fields matter: an assistant turn that requested tools must
+/// carry `tool_calls`, and the matching result must carry `tool_call_id`.
+/// Omitting either produces a `tool` message with no preceding call, which
+/// OpenAI and vLLM reject outright.
+fn format_messages_openai(messages: &[ChatMessage], system_suffix: &str) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|msg| {
+            let is_system = msg.role == crate::core::memory::MessageRole::System;
+            let content = if is_system && !system_suffix.is_empty() {
+                format!("{}{}", msg.content, system_suffix)
+            } else {
+                msg.content.clone()
+            };
+
+            let mut out = json!({ "role": msg.role.to_string(), "content": content });
+
+            if !msg.tool_calls.is_empty() {
+                out["tool_calls"] = json!(msg
+                    .tool_calls
+                    .iter()
+                    .map(|tc| json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments.to_string()
+                        }
+                    }))
+                    .collect::<Vec<_>>());
+            }
+            if let Some(id) = &msg.tool_call_id {
+                out["tool_call_id"] = json!(id);
+            }
+            if let Some(name) = &msg.name {
+                out["name"] = json!(name);
+            }
+            out
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct ModelsListResponse {
     data: Vec<ModelItem>,
@@ -90,6 +134,7 @@ struct ChatChunkDelta {
 struct ToolCallDelta {
     #[serde(default)]
     index: usize,
+    id: Option<String>,
     function: Option<ToolCallFunctionDelta>,
 }
 
@@ -102,19 +147,23 @@ struct ToolCallFunctionDelta {
 /// Reassembles streamed tool-call fragments into whole calls.
 #[derive(Default)]
 struct ToolCallAccumulator {
-    parts: BTreeMap<usize, (String, String)>,
+    /// index -> (id, name, argument fragments)
+    parts: BTreeMap<usize, (String, String, String)>,
 }
 
 impl ToolCallAccumulator {
     fn absorb(&mut self, deltas: &[ToolCallDelta]) {
         for d in deltas {
             let entry = self.parts.entry(d.index).or_default();
+            if let Some(id) = &d.id {
+                entry.0.push_str(id);
+            }
             if let Some(func) = &d.function {
                 if let Some(name) = &func.name {
-                    entry.0.push_str(name);
+                    entry.1.push_str(name);
                 }
                 if let Some(args) = &func.arguments {
-                    entry.1.push_str(args);
+                    entry.2.push_str(args);
                 }
             }
         }
@@ -130,10 +179,16 @@ impl ToolCallAccumulator {
     fn finish(&mut self) -> Vec<ToolCall> {
         std::mem::take(&mut self.parts)
             .into_values()
-            .filter(|(name, _)| !name.is_empty())
-            .map(|(name, args)| ToolCall {
-                name,
-                arguments: serde_json::from_str(&args).unwrap_or_else(|_| json!({})),
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, args)| {
+                let arguments = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
+                // Keep the server's own id when it sent one — it has to match
+                // exactly on the way back.
+                let mut call = ToolCall::new(name, arguments);
+                if !id.is_empty() {
+                    call.id = id;
+                }
+                call
             })
             .collect()
     }
@@ -188,8 +243,7 @@ impl LlmProvider for OpenAiCompatProvider {
         &self,
         model: &str,
         messages: &[ChatMessage],
-        temperature: f32,
-        max_tokens: Option<usize>,
+        options: &ChatOptions,
         tools: &[Arc<dyn Tool>],
     ) -> Result<ChunkStream> {
         let url = format!("{}/chat/completions", self.endpoint);
@@ -216,31 +270,19 @@ impl LlmProvider for OpenAiCompatProvider {
             String::new()
         };
 
-        let mut formatted_messages = Vec::new();
-        for msg in messages {
-            let is_system = msg.role == crate::core::memory::MessageRole::System;
-            let content = if is_system && has_tools {
-                format!("{}{}", msg.content, tools_desc)
-            } else {
-                msg.content.clone()
-            };
-            formatted_messages.push(json!({
-                "role": msg.role.to_string(),
-                "content": content
-            }));
-        }
+        let formatted_messages = format_messages_openai(messages, &tools_desc);
 
         let mut body = json!({
             "model": model,
             "messages": formatted_messages,
-            "temperature": temperature,
+            "temperature": options.temperature,
             "stream": true,
             // Ask for token usage on the terminal chunk so metrics can be
             // reconciled against the server's own count.
             "stream_options": { "include_usage": true }
         });
 
-        if let Some(mt) = max_tokens {
+        if let Some(mt) = options.max_tokens {
             body["max_tokens"] = json!(mt);
         }
 
