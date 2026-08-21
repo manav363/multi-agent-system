@@ -77,6 +77,7 @@ pub struct SharedBlackboard {
     state: Arc<RwLock<HashMap<String, String>>>,
 }
 
+#[allow(dead_code)] // `get` is exercised by tests and useful for consumers
 impl SharedBlackboard {
     pub fn new() -> Self {
         Self {

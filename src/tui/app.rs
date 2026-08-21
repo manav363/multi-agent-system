@@ -1,17 +1,27 @@
 use crate::core::agent::{Agent, AgentRole};
 use crate::core::events::{AgentStatus, OrchestratorEvent};
 use crate::core::orchestrator::{Orchestrator, TopologyMode};
+use crate::core::text::byte_offset;
 use crate::llm::provider::LlmProvider;
 use crate::metrics::tracker::{MetricsTracker, WaterfallSpan};
 use crate::tools::tool::ToolRegistry;
-use crate::tui::widgets::transcript::TranscriptItem;
+use crate::tui::widgets::transcript::{NoticeLevel, TranscriptItem, ViewportInfo};
 use anyhow::Result;
 use chrono::Utc;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::DefaultTerminal;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Transcript entries kept in memory. A long workflow streams megabytes; the
+/// scrollback has to stop somewhere or the process grows without bound.
+const MAX_TRANSCRIPT_ITEMS: usize = 400;
+/// Rows moved per scroll step.
+const SCROLL_STEP: u16 = 3;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
@@ -95,6 +105,13 @@ pub struct App {
     pub blackboard_snapshot: HashMap<String, String>,
     /// Cancellation token for the currently running workflow
     pub workflow_cancel_token: Option<CancellationToken>,
+    /// `(current, total)` step progress for the header readout.
+    pub step_progress: Option<(usize, usize)>,
+    /// Maps a tool call's id to its transcript index, so a result updates the
+    /// call it belongs to even when the same tool is invoked twice in a step.
+    pub pending_tool_calls: HashMap<String, usize>,
+    /// Written during render so scrolling can be clamped to real content.
+    pub transcript_viewport: Cell<ViewportInfo>,
 }
 
 impl App {
@@ -104,6 +121,8 @@ impl App {
         default_model: &str,
     ) -> Result<Self> {
         let (event_tx, event_rx) = unbounded_channel();
+
+        let provider_online = provider.is_available().await;
 
         // Discover installed models
         let mut available_models = provider.list_models().await.unwrap_or_default();
@@ -121,7 +140,9 @@ impl App {
         // Use llama3.2/llama or a secondary model for planner, researcher, synthesizer
         // Use qwen3 or main model for coder, critic
         let (planning_model, coding_model) = {
-            let llama_candidate = available_models.iter().find(|m| m.contains("llama") || m.contains("3.2"));
+            let llama_candidate = available_models
+                .iter()
+                .find(|m| m.contains("llama") || m.contains("3.2"));
             let qwen_candidate = available_models.iter().find(|m| m.contains("qwen"));
 
             match (llama_candidate, qwen_candidate) {
@@ -135,14 +156,34 @@ impl App {
         let orchestrator = Orchestrator::with_models(
             TopologyMode::Hierarchical,
             provider.clone(),
-            &planning_model,  // planner
-            &planning_model,  // researcher
-            &coding_model,    // coder
-            &coding_model,    // critic
-            &planning_model,  // synthesizer
+            &planning_model, // planner
+            &planning_model, // researcher
+            &coding_model,   // coder
+            &coding_model,   // critic
+            &planning_model, // synthesizer
             tools,
             Some(event_tx.clone()),
         );
+
+        let selected_model_idx = available_models
+            .iter()
+            .position(|m| m == &selected_model)
+            .unwrap_or(0);
+
+        let mut transcript_items = Vec::new();
+        let mut system_logs = Vec::new();
+        if !provider_online {
+            let msg = format!(
+                "{} at {} is not responding. Start it before submitting a goal.",
+                provider.name(),
+                provider.endpoint()
+            );
+            system_logs.push(format!("[ERROR] Provider: {}", msg));
+            transcript_items.push(TranscriptItem::Notice {
+                level: NoticeLevel::Error,
+                text: msg,
+            });
+        }
 
         Ok(Self {
             active_tab: ActiveTab::Studio,
@@ -151,12 +192,12 @@ impl App {
             input_cursor_pos: 0,
             orchestrator,
             available_models,
-            selected_model_idx: 0,
+            selected_model_idx,
             selected_topology_idx: 0,
             selected_agent_idx: 0,
-            transcript_items: Vec::new(),
+            transcript_items,
             metrics: MetricsTracker::new(),
-            system_logs: Vec::new(),
+            system_logs,
             scroll_offset: 0,
             auto_scroll: true,
             spinner_idx: 0,
@@ -167,6 +208,9 @@ impl App {
             event_tx,
             blackboard_snapshot: HashMap::new(),
             workflow_cancel_token: None,
+            step_progress: None,
+            pending_tool_calls: HashMap::new(),
+            transcript_viewport: Cell::new(ViewportInfo::default()),
         })
     }
 
@@ -194,61 +238,134 @@ impl App {
         let tick_rate = Duration::from_millis(60);
 
         loop {
-            // 1. Draw Terminal UI
-            terminal.draw(|f| {
-                crate::tui::ui::render_app_ui(f, &self);
-            })?;
-
-            // 2. Handle Orchestrator Async Events (non-blocking)
+            // Drain orchestrator events *before* drawing, so a frame never
+            // renders state that is already one tick stale.
             while let Ok(event) = self.event_rx.try_recv() {
                 self.handle_orchestrator_event(event);
             }
 
-            // 3. Handle Keyboard & Mouse Input
+            terminal.draw(|f| {
+                crate::tui::ui::render_app_ui(f, &self);
+            })?;
+
             if event::poll(tick_rate)? {
-                if let Event::Key(key) = event::read()? {
-                    if self.handle_key_event(key).await? {
-                        // Exit requested
-                        break;
+                match event::read()? {
+                    // On Windows every key produces both a Press and a Release;
+                    // acting on both types each keystroke twice.
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if self.handle_key_event(key).await? {
+                            break;
+                        }
                     }
+                    Event::Mouse(mouse) => self.handle_mouse_event(mouse),
+                    _ => {}
                 }
             } else {
-                // Tick update
-                self.spinner_idx = (self.spinner_idx + 1) % 1000;
+                self.spinner_idx = self.spinner_idx.wrapping_add(1);
+                self.refresh_blackboard().await;
             }
         }
 
         Ok(())
     }
 
+    /// Pull the live blackboard into a snapshot the synchronous renderer can read.
+    async fn refresh_blackboard(&mut self) {
+        if self.is_running_workflow || self.active_tab == ActiveTab::Blackboard {
+            self.blackboard_snapshot = self.orchestrator.blackboard.get_all().await;
+        }
+    }
+
+    fn handle_mouse_event(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_by(-(SCROLL_STEP as i32)),
+            MouseEventKind::ScrollDown => self.scroll_by(SCROLL_STEP as i32),
+            _ => {}
+        }
+    }
+
+    /// Move the transcript view, clamped to the content measured at last render.
+    ///
+    /// Scrolling back pins the view; scrolling to the bottom re-arms follow mode,
+    /// so live output resumes streaming into sight without a keypress.
+    pub fn scroll_by(&mut self, delta: i32) {
+        let (offset, following) = self.transcript_viewport.get().apply_scroll(
+            self.scroll_offset,
+            self.auto_scroll,
+            delta,
+        );
+        self.scroll_offset = offset;
+        self.auto_scroll = following;
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = 0;
+        self.auto_scroll = false;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = self.transcript_viewport.get().max_scroll();
+        self.auto_scroll = true;
+    }
+
+    /// Page size for PageUp/PageDown, never zero.
+    fn page_size(&self) -> i32 {
+        self.transcript_viewport.get().view_height.max(2) as i32 - 1
+    }
+
+    fn push_transcript(&mut self, item: TranscriptItem) {
+        self.transcript_items.push(item);
+        if self.transcript_items.len() > MAX_TRANSCRIPT_ITEMS {
+            let overflow = self.transcript_items.len() - MAX_TRANSCRIPT_ITEMS;
+            self.transcript_items.drain(..overflow);
+            // Transcript indices just shifted; re-anchor the outstanding
+            // tool-call bookmarks or they would point at the wrong entries.
+            self.pending_tool_calls
+                .retain(|_, idx| match idx.checked_sub(overflow) {
+                    Some(shifted) => {
+                        *idx = shifted;
+                        true
+                    }
+                    None => false,
+                });
+        }
+    }
+
     fn handle_orchestrator_event(&mut self, event: OrchestratorEvent) {
         match event {
-            OrchestratorEvent::AgentStatusChanged { agent_id, new_status, .. } => {
+            OrchestratorEvent::AgentStatusChanged {
+                agent_id,
+                new_status,
+                ..
+            } => {
                 if let Some(agent) = self.orchestrator.agents.get_mut(&agent_id) {
                     agent.status = new_status;
                 }
                 if new_status == AgentStatus::Streaming {
                     self.current_streaming_agent_id = Some(agent_id.clone());
                     self.metrics.on_agent_start(&agent_id);
-                } else if new_status == AgentStatus::Done || new_status == AgentStatus::Error {
-                    if self.current_streaming_agent_id.as_deref() == Some(&agent_id) {
-                        self.current_streaming_agent_id = None;
-                        self.current_streaming_thought.clear();
-                    }
+                } else if matches!(new_status, AgentStatus::Done | AgentStatus::Error)
+                    && self.current_streaming_agent_id.as_deref() == Some(&agent_id)
+                {
+                    self.current_streaming_agent_id = None;
+                    self.current_streaming_thought.clear();
                 }
             }
-            OrchestratorEvent::AgentTokenChunk { agent_id, role: _, delta, is_thought, .. } => {
+            OrchestratorEvent::AgentTokenChunk {
+                agent_id,
+                delta,
+                is_thought,
+                ..
+            } => {
                 self.metrics.on_token(&agent_id);
-
-                let agent_name = self.orchestrator.agents.get(&agent_id).map(|a| a.config.name.clone()).unwrap_or_else(|| agent_id.clone());
-                let agent_role = self.orchestrator.agents.get(&agent_id).map(|a| a.config.role.clone()).unwrap_or(AgentRole::Coder);
 
                 if is_thought {
                     self.current_streaming_thought.push_str(&delta);
                 }
 
-                // Check if the last transcript item is an output from this agent
-                let append_to_last = match self.transcript_items.last_mut() {
+                // Append to the agent's existing block when it is still the one
+                // streaming, so one turn stays one transcript entry.
+                let appended = match self.transcript_items.last_mut() {
                     Some(TranscriptItem::AgentOutput {
                         agent_id: last_id,
                         text,
@@ -256,11 +373,13 @@ impl App {
                         is_streaming,
                         ..
                     }) if last_id == &agent_id => {
-                        if !is_thought {
+                        if is_thought {
+                            match thoughts {
+                                Some(existing) => existing.push_str(&delta),
+                                None => *thoughts = Some(delta.clone()),
+                            }
+                        } else {
                             text.push_str(&delta);
-                        }
-                        if !self.current_streaming_thought.is_empty() {
-                            *thoughts = Some(self.current_streaming_thought.clone());
                         }
                         *is_streaming = true;
                         true
@@ -268,118 +387,250 @@ impl App {
                     _ => false,
                 };
 
-                if !append_to_last {
-                    // Mark previous streaming item as done
-                    if let Some(TranscriptItem::AgentOutput { is_streaming, .. }) = self.transcript_items.last_mut() {
-                        *is_streaming = false;
-                    }
+                if !appended {
+                    self.mark_last_output_finished();
 
-                    let initial_text = if is_thought { String::new() } else { delta };
-                    let thoughts = if is_thought { Some(self.current_streaming_thought.clone()) } else { None };
+                    let agent = self.orchestrator.agents.get(&agent_id);
+                    let agent_name = agent
+                        .map(|a| a.config.name.clone())
+                        .unwrap_or_else(|| agent_id.clone());
+                    let role = agent
+                        .map(|a| a.config.role.clone())
+                        .unwrap_or(AgentRole::Coder);
 
-                    self.transcript_items.push(TranscriptItem::AgentOutput {
+                    let (text, thoughts) = if is_thought {
+                        (String::new(), Some(delta))
+                    } else {
+                        (delta, None)
+                    };
+
+                    self.push_transcript(TranscriptItem::AgentOutput {
                         agent_id,
                         agent_name,
-                        role: agent_role,
-                        text: initial_text,
+                        role,
+                        text,
                         thoughts,
                         is_streaming: true,
                     });
                 }
             }
-            OrchestratorEvent::ToolCallStarted { agent_id, tool_name, args, .. } => {
-                let agent_name = self.orchestrator.agents.get(&agent_id).map(|a| a.config.name.clone()).unwrap_or_else(|| agent_id.clone());
-                self.transcript_items.push(TranscriptItem::ToolExecution {
+            OrchestratorEvent::ToolCallStarted {
+                agent_id,
+                tool_name,
+                args,
+                call_id,
+                ..
+            } => {
+                let agent_name = self
+                    .orchestrator
+                    .agents
+                    .get(&agent_id)
+                    .map(|a| a.config.name.clone())
+                    .unwrap_or_else(|| agent_id.clone());
+
+                self.mark_last_output_finished();
+                self.push_transcript(TranscriptItem::ToolExecution {
                     agent_name,
                     tool_name,
                     args,
-                    output: "Executing...".to_string(),
+                    output: String::new(),
                     is_error: false,
                     duration_ms: 0,
+                    is_running: true,
                 });
+                let index = self.transcript_items.len() - 1;
+                self.pending_tool_calls.insert(call_id, index);
             }
-            OrchestratorEvent::ToolCallFinished { agent_id, tool_name, result, is_error, duration_ms, .. } => {
+            OrchestratorEvent::ToolCallFinished {
+                agent_id,
+                call_id,
+                result,
+                is_error,
+                duration_ms,
+                ..
+            } => {
                 self.metrics.on_tool_finished(&agent_id, duration_ms);
 
-                // Update the corresponding tool execution in transcript
-                for item in self.transcript_items.iter_mut().rev() {
-                    if let TranscriptItem::ToolExecution { tool_name: t_name, output, is_error: err, duration_ms: dur, .. } = item {
-                        if t_name == &tool_name {
-                            *output = result;
-                            *err = is_error;
-                            *dur = duration_ms;
-                            break;
-                        }
+                // Look the entry up by call id. Matching on tool name alone
+                // wrote a result into the first call with that name, which is
+                // the wrong one as soon as a tool is invoked more than once.
+                if let Some(index) = self.pending_tool_calls.remove(&call_id) {
+                    if let Some(TranscriptItem::ToolExecution {
+                        output,
+                        is_error: err,
+                        duration_ms: dur,
+                        is_running,
+                        ..
+                    }) = self.transcript_items.get_mut(index)
+                    {
+                        *output = result;
+                        *err = is_error;
+                        *dur = duration_ms;
+                        *is_running = false;
                     }
                 }
             }
-            OrchestratorEvent::WorkflowStepStarted { title, .. } => {
-                self.transcript_items.push(TranscriptItem::Milestone {
+            OrchestratorEvent::MetricsTick {
+                agent_id,
+                total_tokens,
+                ..
+            } => {
+                self.metrics.reconcile_agent_tokens(&agent_id, total_tokens);
+            }
+            OrchestratorEvent::WorkflowStepStarted {
+                title,
+                step_index,
+                total_steps,
+                ..
+            } => {
+                self.step_progress = Some((step_index, total_steps));
+                self.mark_last_output_finished();
+                self.push_transcript(TranscriptItem::Milestone {
                     step_title: title,
+                    step_index,
+                    total_steps,
                     duration_ms: None,
                 });
             }
-            OrchestratorEvent::WorkflowStepFinished { step_index, title, agent_id, duration_ms, output_preview, .. } => {
-                let agent_name = self.orchestrator.agents.get(&agent_id).map(|a| a.config.name.clone()).unwrap_or_default();
+            OrchestratorEvent::WorkflowStepFinished {
+                step_index,
+                title,
+                agent_id,
+                duration_ms,
+                start_offset_ms,
+                tokens,
+                tool_calls,
+                ..
+            } => {
+                let agent_name = self
+                    .orchestrator
+                    .agents
+                    .get(&agent_id)
+                    .map(|a| a.config.name.clone())
+                    .unwrap_or_default();
                 let m = self.metrics.agent_metrics.get(&agent_id);
-                let tokens = m.map(|x| x.total_tokens).unwrap_or(0);
-                let tps = m.map(|x| x.avg_tps).unwrap_or(0.0);
-                let ttft = m.and_then(|x| x.ttft_ms);
 
                 self.metrics.add_waterfall_span(WaterfallSpan {
                     step_index,
                     title: title.clone(),
                     agent_id: agent_id.clone(),
                     agent_name,
-                    start_offset_ms: 0,
+                    start_offset_ms,
                     duration_ms,
-                    ttft_ms: ttft,
+                    ttft_ms: m.and_then(|x| x.ttft_ms),
                     tokens_generated: tokens,
-                    avg_tps: tps,
-                    tool_calls_count: 0,
+                    avg_tps: m.map(|x| x.avg_tps).unwrap_or(0.0),
+                    tool_calls_count: tool_calls,
                 });
 
-                // Update live blackboard snapshot with step output
-                self.blackboard_snapshot.insert(agent_id.clone(), output_preview);
-
-                // Update milestone duration
+                // Stamp the duration onto this step's milestone. Steps are
+                // matched by index, not title — two topologies reuse titles.
                 for item in self.transcript_items.iter_mut().rev() {
-                    if let TranscriptItem::Milestone { step_title, duration_ms: dur } = item {
-                        if step_title == &title {
+                    if let TranscriptItem::Milestone {
+                        step_index: idx,
+                        duration_ms: dur,
+                        ..
+                    } = item
+                    {
+                        if *idx == step_index {
                             *dur = Some(duration_ms);
                             break;
                         }
                     }
                 }
             }
-            OrchestratorEvent::WorkflowOverallCompleted { .. } => {
+            OrchestratorEvent::WorkflowOverallCompleted {
+                total_duration_ms,
+                total_tokens,
+                ..
+            } => {
                 self.is_running_workflow = false;
-                if let Some(TranscriptItem::AgentOutput { is_streaming, .. }) = self.transcript_items.last_mut() {
-                    *is_streaming = false;
-                }
+                self.workflow_cancel_token = None;
+                self.step_progress = None;
+                self.mark_last_output_finished();
+                self.push_transcript(TranscriptItem::Notice {
+                    level: NoticeLevel::Success,
+                    text: format!(
+                        "Workflow complete in {:.1}s · {} tokens · {:.1} tok/s average",
+                        total_duration_ms as f64 / 1000.0,
+                        total_tokens,
+                        self.metrics.overall_average_tps()
+                    ),
+                });
             }
-            OrchestratorEvent::SystemLog { level, target, message, .. } => {
-                let formatted = format!("[{}] {}: {}", level, target, message);
-                self.system_logs.push(formatted);
-                if self.system_logs.len() > 100 {
+            OrchestratorEvent::SystemLog {
+                level,
+                target,
+                message,
+                ..
+            } => {
+                self.system_logs
+                    .push(format!("[{}] {}: {}", level, target, message));
+                if self.system_logs.len() > 200 {
                     self.system_logs.remove(0);
+                }
+
+                // Surface anything that went wrong in the transcript too —
+                // a truncated stream or a rejected tool call is invisible if it
+                // only ever lands in a tab the user is not looking at.
+                let notice_level = match level.as_str() {
+                    "ERROR" => Some(NoticeLevel::Error),
+                    "WARN" => Some(NoticeLevel::Warning),
+                    _ => None,
+                };
+                if let Some(notice_level) = notice_level {
+                    self.mark_last_output_finished();
+                    self.push_transcript(TranscriptItem::Notice {
+                        level: notice_level,
+                        text: format!("{}: {}", target, message),
+                    });
                 }
             }
             OrchestratorEvent::WorkflowCancelled { reason, .. } => {
                 self.is_running_workflow = false;
                 self.workflow_cancel_token = None;
-                if let Some(TranscriptItem::AgentOutput { is_streaming, .. }) = self.transcript_items.last_mut() {
-                    *is_streaming = false;
-                }
-                self.system_logs.push(format!("[WARN] Workflow cancelled: {}", reason));
+                self.step_progress = None;
+                self.mark_last_output_finished();
+                self.system_logs
+                    .push(format!("[WARN] Workflow cancelled: {}", reason));
+                self.push_transcript(TranscriptItem::Notice {
+                    level: NoticeLevel::Warning,
+                    text: format!("Workflow cancelled — {}", reason),
+                });
             }
-            _ => {}
+        }
+    }
+
+    /// Delete the word to the left of the cursor (Ctrl+W).
+    fn delete_word_before_cursor(&mut self) {
+        let chars: Vec<char> = self.prompt_input.chars().collect();
+        let mut cursor = self.input_cursor_pos.min(chars.len());
+        while cursor > 0 && chars[cursor - 1].is_whitespace() {
+            cursor -= 1;
+        }
+        while cursor > 0 && !chars[cursor - 1].is_whitespace() {
+            cursor -= 1;
+        }
+        let from = byte_offset(&self.prompt_input, cursor);
+        let to = byte_offset(&self.prompt_input, self.input_cursor_pos);
+        self.prompt_input.drain(from..to);
+        self.input_cursor_pos = cursor;
+    }
+
+    /// Clear the streaming flag on the most recent agent block.
+    fn mark_last_output_finished(&mut self) {
+        if let Some(TranscriptItem::AgentOutput { is_streaming, .. }) =
+            self.transcript_items.last_mut()
+        {
+            *is_streaming = false;
         }
     }
 
     async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         // Global quit shortcut
-        if key.modifiers.contains(KeyModifiers::CONTROL) && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('d')) {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('d'))
+        {
             return Ok(true);
         }
 
@@ -391,7 +642,8 @@ impl App {
                     if self.is_running_workflow {
                         if let Some(token) = &self.workflow_cancel_token {
                             token.cancel();
-                            self.system_logs.push("[INFO] Cancellation requested...".to_string());
+                            self.system_logs
+                                .push("[INFO] Cancellation requested...".to_string());
                         }
                     }
                 }
@@ -419,24 +671,29 @@ impl App {
                 }
                 KeyCode::Char('c') => {
                     self.transcript_items.clear();
+                    self.pending_tool_calls.clear();
                     self.scroll_offset = 0;
+                    self.auto_scroll = true;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(2);
-                    self.auto_scroll = false;
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_by(-(SCROLL_STEP as i32)),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_by(SCROLL_STEP as i32),
+                KeyCode::PageUp => {
+                    let page = self.page_size();
+                    self.scroll_by(-page);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(2);
+                KeyCode::PageDown => {
+                    let page = self.page_size();
+                    self.scroll_by(page);
                 }
+                KeyCode::Home | KeyCode::Char('g') => self.scroll_to_top(),
+                KeyCode::End | KeyCode::Char('G') => self.scroll_to_bottom(),
                 KeyCode::Left => {
-                    if self.selected_agent_idx > 0 {
-                        self.selected_agent_idx -= 1;
-                    }
+                    self.selected_agent_idx = self.selected_agent_idx.saturating_sub(1);
                 }
                 KeyCode::Right => {
-                    if self.selected_agent_idx < 4 {
-                        self.selected_agent_idx += 1;
-                    }
+                    // Bounded by the actual roster, not a hardcoded 4.
+                    let last = self.ordered_agents().len().saturating_sub(1);
+                    self.selected_agent_idx = (self.selected_agent_idx + 1).min(last);
                 }
                 _ => {}
             },
@@ -452,13 +709,13 @@ impl App {
                         self.input_mode = InputMode::Normal;
                         self.auto_scroll = true;
 
-                        // Add to transcript
-                        self.transcript_items.push(TranscriptItem::UserGoal {
+                        self.push_transcript(TranscriptItem::UserGoal {
                             text: prompt.clone(),
                             timestamp: Utc::now().format("%H:%M:%S").to_string(),
                         });
 
                         self.metrics.start_workflow();
+                        self.pending_tool_calls.clear();
                         self.is_running_workflow = true;
 
                         // Spawn workflow task
@@ -468,7 +725,8 @@ impl App {
                             &self.available_models[self.selected_model_idx],
                             self.orchestrator.tools.clone(),
                             Some(self.event_tx.clone()),
-                        );
+                        )
+                        .with_blackboard(self.orchestrator.blackboard.clone());
 
                         // Copy per-agent model configurations
                         for (id, agent) in &self.orchestrator.agents {
@@ -484,7 +742,7 @@ impl App {
                         let event_tx_clone = self.event_tx.clone();
                         tokio::spawn(async move {
                             match orchestrator_clone.execute_goal(&prompt).await {
-                                Ok(_) => {},
+                                Ok(_) => {}
                                 Err(e) => {
                                     let msg = format!("{}", e);
                                     if !msg.contains("cancelled") {
@@ -500,24 +758,43 @@ impl App {
                         });
                     }
                 }
+                // `input_cursor_pos` counts characters, but `String::insert`
+                // and `String::remove` take byte offsets and panic anywhere
+                // else. Every edit below converts before touching the string,
+                // so typing an accent or an emoji no longer aborts the app.
                 KeyCode::Backspace => {
-                    if self.input_cursor_pos > 0 && !self.prompt_input.is_empty() {
-                        self.prompt_input.remove(self.input_cursor_pos - 1);
+                    if self.input_cursor_pos > 0 {
+                        let at = byte_offset(&self.prompt_input, self.input_cursor_pos - 1);
+                        self.prompt_input.remove(at);
                         self.input_cursor_pos -= 1;
+                    }
+                }
+                KeyCode::Delete => {
+                    let at = byte_offset(&self.prompt_input, self.input_cursor_pos);
+                    if at < self.prompt_input.len() {
+                        self.prompt_input.remove(at);
                     }
                 }
                 KeyCode::Left => {
-                    if self.input_cursor_pos > 0 {
-                        self.input_cursor_pos -= 1;
-                    }
+                    self.input_cursor_pos = self.input_cursor_pos.saturating_sub(1);
                 }
                 KeyCode::Right => {
-                    if self.input_cursor_pos < self.prompt_input.len() {
-                        self.input_cursor_pos += 1;
-                    }
+                    let len = self.prompt_input.chars().count();
+                    self.input_cursor_pos = (self.input_cursor_pos + 1).min(len);
+                }
+                KeyCode::Home => self.input_cursor_pos = 0,
+                KeyCode::End => self.input_cursor_pos = self.prompt_input.chars().count(),
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let at = byte_offset(&self.prompt_input, self.input_cursor_pos);
+                    self.prompt_input.drain(..at);
+                    self.input_cursor_pos = 0;
+                }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.delete_word_before_cursor();
                 }
                 KeyCode::Char(c) => {
-                    self.prompt_input.insert(self.input_cursor_pos, c);
+                    let at = byte_offset(&self.prompt_input, self.input_cursor_pos);
+                    self.prompt_input.insert(at, c);
                     self.input_cursor_pos += 1;
                 }
                 _ => {}
@@ -544,12 +821,18 @@ impl App {
                                 let agent_id = agent.config.id.clone();
                                 if let Some(target) = self.orchestrator.agents.get_mut(&agent_id) {
                                     target.config.model = chosen_model.clone();
-                                    self.system_logs.push(format!("Model for {} switched to: {}", target.config.name, chosen_model));
+                                    self.system_logs.push(format!(
+                                        "Model for {} switched to: {}",
+                                        target.config.name, chosen_model
+                                    ));
                                 }
                             }
                         } else {
                             self.orchestrator.set_model_for_all(chosen_model);
-                            self.system_logs.push(format!("Active model for all agents switched to: {}", chosen_model));
+                            self.system_logs.push(format!(
+                                "Active model for all agents switched to: {}",
+                                chosen_model
+                            ));
                         }
                     }
                     self.input_mode = InputMode::Normal;
@@ -573,7 +856,8 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(&topo) = Self::topologies().get(self.selected_topology_idx) {
                         self.orchestrator.topology = topo;
-                        self.system_logs.push(format!("Topology switched to: {}", topo.name()));
+                        self.system_logs
+                            .push(format!("Topology switched to: {}", topo.name()));
                     }
                     self.input_mode = InputMode::Normal;
                 }

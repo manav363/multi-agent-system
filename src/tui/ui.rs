@@ -1,10 +1,13 @@
 use crate::tui::app::{ActiveTab, App, InputMode};
-use crate::tui::widgets::{render_agent_pipeline_cards, render_metrics_dashboard, render_transcript};
+use crate::tui::widgets::{
+    render_agent_pipeline_cards, render_metrics_dashboard, render_transcript,
+};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 pub fn render_app_ui(f: &mut Frame, app: &App) {
     let size = f.area();
@@ -46,17 +49,36 @@ pub fn render_app_ui(f: &mut Frame, app: &App) {
 fn render_header_and_tabs(f: &mut Frame, area: Rect, app: &App) {
     let header_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(40), Constraint::Length(36)])
+        .constraints([
+            Constraint::Length(24),
+            Constraint::Min(30),
+            Constraint::Length(52),
+        ])
         .split(area);
 
     // Left: Brand Logo
     let title_line = Line::from(vec![
-        Span::styled("⚡ AGENT ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled("ORCHESTRA", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "⚡ AGENT ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "ORCHESTRA",
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" v0.1", Style::default().fg(Color::DarkGray)),
     ]);
-    let title_block = Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::Rgb(60, 65, 80)));
-    f.render_widget(Paragraph::new(title_line).block(title_block), header_chunks[0]);
+    let title_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::Rgb(60, 65, 80)));
+    f.render_widget(
+        Paragraph::new(title_line).block(title_block),
+        header_chunks[0],
+    );
 
     // Middle: Tab Bar
     let tab_titles: Vec<Line> = ActiveTab::all()
@@ -65,29 +87,70 @@ fn render_header_and_tabs(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let tabs = Tabs::new(tab_titles)
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::Rgb(60, 65, 80))))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::Rgb(60, 65, 80))),
+        )
         .select(app.active_tab as usize)
         .style(Style::default().fg(Color::Gray))
-        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
 
     f.render_widget(tabs, header_chunks[1]);
 
     // Right: Active Topology & Live Status
-    let active_model = app.available_models.get(app.selected_model_idx).cloned().unwrap_or_else(|| "default".to_string());
-    let status_str = if app.is_running_workflow { "⚡ RUNNING" } else { "● READY" };
-    let status_color = if app.is_running_workflow { Color::Green } else { Color::Cyan };
+    let active_model = app
+        .available_models
+        .get(app.selected_model_idx)
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+
+    let (status_str, status_color) = if app.is_running_workflow {
+        let elapsed = app.metrics.global_elapsed_ms() as f64 / 1000.0;
+        match app.step_progress {
+            Some((current, total)) => (
+                format!("⚡ STEP {}/{} · {:.0}s", current, total, elapsed),
+                Color::Green,
+            ),
+            None => (format!("⚡ RUNNING · {:.0}s", elapsed), Color::Green),
+        }
+    } else {
+        ("● READY".to_string(), Color::Cyan)
+    };
 
     let right_info = Line::from(vec![
-        Span::styled(format!("{:<10} ", app.orchestrator.topology.name()), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("| {} | ", active_model), Style::default().fg(Color::Rgb(170, 170, 190))),
-        Span::styled(status_str, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} ", app.orchestrator.topology.name()),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("│ {} │ ", active_model),
+            Style::default().fg(Color::Rgb(170, 170, 190)),
+        ),
+        Span::styled(
+            status_str,
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
 
     let right_block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(Color::Rgb(60, 65, 80)));
 
-    f.render_widget(Paragraph::new(right_info).block(right_block).alignment(Alignment::Right), header_chunks[2]);
+    f.render_widget(
+        Paragraph::new(right_info)
+            .block(right_block)
+            .alignment(Alignment::Right),
+        header_chunks[2],
+    );
 }
 
 fn render_studio_tab(f: &mut Frame, area: Rect, app: &App) {
@@ -109,13 +172,17 @@ fn render_studio_tab(f: &mut Frame, area: Rect, app: &App) {
         Some(app.selected_agent_idx),
     );
 
-    render_transcript(
+    // The widget reports back what it measured; stash it so key handling can
+    // clamp scrolling to content that actually exists.
+    let viewport = render_transcript(
         f,
         chunks[1],
         &app.transcript_items,
         app.scroll_offset,
         app.auto_scroll,
+        app.spinner_idx,
     );
+    app.transcript_viewport.set(viewport);
 }
 
 fn render_agents_config_tab(f: &mut Frame, area: Rect, app: &App) {
@@ -136,7 +203,16 @@ fn render_agents_config_tab(f: &mut Frame, area: Rect, app: &App) {
             let line = Line::from(vec![
                 Span::styled(marker, Style::default().fg(Color::Yellow)),
                 Span::styled(format!("{} ", agent.config.role.icon()), Style::default()),
-                Span::styled(&agent.config.name, Style::default().fg(agent.config.role.default_color()).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })),
+                Span::styled(
+                    &agent.config.name,
+                    Style::default()
+                        .fg(agent.config.role.default_color())
+                        .add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
             ]);
             ListItem::new(line)
         })
@@ -145,7 +221,12 @@ fn render_agents_config_tab(f: &mut Frame, area: Rect, app: &App) {
     let list_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
-        .title(Span::styled(" Agent Roster ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Agent Roster ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
 
     let list = List::new(items).block(list_block);
     f.render_widget(list, chunks[0]);
@@ -158,7 +239,9 @@ fn render_agents_config_tab(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
         .title(Span::styled(
             format!(" Configuration: {} ", sel_agent.config.name),
-            Style::default().fg(sel_agent.config.role.default_color()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(sel_agent.config.role.default_color())
+                .add_modifier(Modifier::BOLD),
         ));
 
     let tools_str = if sel_agent.config.enabled_tools.is_empty() {
@@ -170,7 +253,12 @@ fn render_agents_config_tab(f: &mut Frame, area: Rect, app: &App) {
     let details = vec![
         Line::from(vec![
             Span::styled("Role:         ", Style::default().fg(Color::Gray)),
-            Span::styled(sel_agent.config.role.name(), Style::default().fg(sel_agent.config.role.default_color()).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                sel_agent.config.role.name(),
+                Style::default()
+                    .fg(sel_agent.config.role.default_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Model:        ", Style::default().fg(Color::Gray)),
@@ -178,26 +266,34 @@ fn render_agents_config_tab(f: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("Temperature:  ", Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:.2}", sel_agent.config.temperature), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{:.2}", sel_agent.config.temperature),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::styled("  |  Max Tokens: ", Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:?}", sel_agent.config.max_tokens), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{:?}", sel_agent.config.max_tokens),
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Tools:        ", Style::default().fg(Color::Gray)),
             Span::styled(tools_str, Style::default().fg(Color::LightMagenta)),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("── System Prompt Instructions ────────────────────────────────────", Style::default().fg(Color::DarkGray)),
-        ]),
+        Line::from(vec![Span::styled(
+            "── System Prompt Instructions ────────────────────────────────────",
+            Style::default().fg(Color::DarkGray),
+        )]),
         Line::from(""),
     ];
 
     let mut all_lines = details;
     for l in sel_agent.config.system_prompt.lines() {
-        all_lines.push(Line::from(vec![
-            Span::styled(format!("  {}", l), Style::default().fg(Color::Rgb(210, 210, 220))),
-        ]));
+        all_lines.push(Line::from(vec![Span::styled(
+            format!("  {}", l),
+            Style::default().fg(Color::Rgb(210, 210, 220)),
+        )]));
     }
 
     let detail_paragraph = Paragraph::new(all_lines)
@@ -217,19 +313,28 @@ fn render_blackboard_and_logs_tab(f: &mut Frame, area: Rect, app: &App) {
     let blackboard_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
-        .title(Span::styled(" Shared Memory & Blackboard (Live) ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Shared Memory & Blackboard (Live) ",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ));
 
     let mut blackboard_lines = vec![
-        Line::from(vec![
-            Span::styled("  Inter-agent shared context memory:", Style::default().fg(Color::DarkGray)),
-        ]),
+        Line::from(vec![Span::styled(
+            "  Inter-agent shared context memory:",
+            Style::default().fg(Color::DarkGray),
+        )]),
         Line::from(""),
     ];
 
     if app.blackboard_snapshot.is_empty() {
         blackboard_lines.push(Line::from(vec![
             Span::styled("  (empty) ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Run a workflow to populate blackboard.", Style::default().fg(Color::Rgb(120, 120, 130))),
+            Span::styled(
+                "Run a workflow to populate blackboard.",
+                Style::default().fg(Color::Rgb(120, 120, 130)),
+            ),
         ]));
     } else {
         // Sort keys for consistent display
@@ -247,15 +352,21 @@ fn render_blackboard_and_logs_tab(f: &mut Frame, area: Rect, app: &App) {
 
                 blackboard_lines.push(Line::from(vec![
                     Span::styled("  ● ", Style::default().fg(Color::Cyan)),
-                    Span::styled(format!("{}: ", key), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{}: ", key),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         format!("({} bytes)", value.len()),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
-                blackboard_lines.push(Line::from(vec![
-                    Span::styled(format!("    {}{}", preview, suffix), Style::default().fg(Color::Rgb(180, 180, 190))),
-                ]));
+                blackboard_lines.push(Line::from(vec![Span::styled(
+                    format!("    {}{}", preview, suffix),
+                    Style::default().fg(Color::Rgb(180, 180, 190)),
+                )]));
                 blackboard_lines.push(Line::from(""));
             }
         }
@@ -272,7 +383,12 @@ fn render_blackboard_and_logs_tab(f: &mut Frame, area: Rect, app: &App) {
     let logs_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
-        .title(Span::styled(" System Event Logs ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " System Event Logs ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
 
     let log_items: Vec<ListItem> = app
         .system_logs
@@ -285,7 +401,10 @@ fn render_blackboard_and_logs_tab(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 Color::Rgb(160, 160, 170)
             };
-            ListItem::new(Line::from(vec![Span::styled(format!("  {}", log), Style::default().fg(color))]))
+            ListItem::new(Line::from(vec![Span::styled(
+                format!("  {}", log),
+                Style::default().fg(color),
+            )]))
         })
         .collect();
 
@@ -296,7 +415,11 @@ fn render_blackboard_and_logs_tab(f: &mut Frame, area: Rect, app: &App) {
 fn render_input_bar(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(12), Constraint::Min(20), Constraint::Length(45)])
+        .constraints([
+            Constraint::Length(12),
+            Constraint::Min(20),
+            Constraint::Length(45),
+        ])
         .split(area);
 
     let (mode_badge, mode_color) = match app.input_mode {
@@ -309,9 +432,12 @@ fn render_input_bar(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(mode_color));
 
     f.render_widget(
-        Paragraph::new(Span::styled(mode_badge, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)))
-            .block(mode_block)
-            .alignment(Alignment::Center),
+        Paragraph::new(Span::styled(
+            mode_badge,
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        ))
+        .block(mode_block)
+        .alignment(Alignment::Center),
         chunks[0],
     );
 
@@ -325,36 +451,110 @@ fn render_input_bar(f: &mut Frame, area: Rect, app: &App) {
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(input_border_color))
-        .title(Span::styled(" Prompt / Goal Input ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Prompt / Goal Input ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
 
-    let prompt_display = if app.prompt_input.is_empty() && app.input_mode != InputMode::EditingPrompt {
-        Span::styled("Press [i] or [Enter] to type goal...", Style::default().fg(Color::DarkGray))
-    } else {
-        Span::styled(&app.prompt_input, Style::default().fg(Color::White))
-    };
+    // Cursor position is measured in display columns, not characters: a CJK
+    // glyph is two columns wide and an emoji can be more, so counting
+    // characters drifts the caret away from the text it is meant to sit on.
+    let inner_width = chunks[1].width.saturating_sub(2) as usize;
+    let prefix: String = app
+        .prompt_input
+        .chars()
+        .take(app.input_cursor_pos)
+        .collect();
+    let cursor_col = UnicodeWidthStr::width(prefix.as_str());
+    // Keep the caret in view on input longer than the box.
+    let h_scroll = cursor_col.saturating_sub(inner_width.saturating_sub(1));
 
-    let prompt_p = Paragraph::new(prompt_display).block(input_block);
-    f.render_widget(prompt_p, chunks[1]);
+    let prompt_display =
+        if app.prompt_input.is_empty() && app.input_mode != InputMode::EditingPrompt {
+            Span::styled(
+                "Press [i] or [Enter] to type a goal…",
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            Span::styled(&app.prompt_input, Style::default().fg(Color::White))
+        };
+
+    f.render_widget(
+        Paragraph::new(prompt_display)
+            .block(input_block)
+            .scroll((0, h_scroll as u16)),
+        chunks[1],
+    );
 
     if app.input_mode == InputMode::EditingPrompt {
-        let cursor_x = chunks[1].x + 1 + app.input_cursor_pos as u16;
-        let cursor_y = chunks[1].y + 1;
-        f.set_cursor_position((cursor_x, cursor_y));
+        f.set_cursor_position((
+            chunks[1].x + 1 + (cursor_col - h_scroll) as u16,
+            chunks[1].y + 1,
+        ));
     }
 
     // Right shortcut hints
-    let shortcuts = Line::from(vec![
-        Span::styled("[t]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        Span::styled(" Topo  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[m]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(" Model  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[c]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(" Clear  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[?]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::styled(" Help  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[q]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        Span::styled(" Quit", Style::default().fg(Color::DarkGray)),
-    ]);
+    let shortcuts = if app.is_running_workflow {
+        Line::from(vec![
+            Span::styled(
+                "[Esc]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Cancel run  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "[j/k]",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "[G]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Follow", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "[t]",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Topo  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "[m]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Model  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "[c]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Clear  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "[?]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Help  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "[q]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Quit", Style::default().fg(Color::DarkGray)),
+        ])
+    };
 
     let shortcuts_block = Block::default()
         .borders(Borders::ALL)
@@ -400,7 +600,9 @@ fn render_model_modal(f: &mut Frame, area: Rect, app: &App) {
             let is_sel = idx == app.selected_model_idx;
             let marker = if is_sel { "▶ " } else { "  " };
             let style = if is_sel {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -414,7 +616,12 @@ fn render_model_modal(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(" Select Active Open-Source Model (↑/↓ Enter) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Select Active Open-Source Model (↑/↓ Enter) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
 
     f.render_widget(List::new(items).block(block), popup_area);
 }
@@ -431,7 +638,9 @@ fn render_topology_modal(f: &mut Frame, area: Rect, app: &App) {
             let is_sel = idx == app.selected_topology_idx;
             let marker = if is_sel { "▶ " } else { "  " };
             let style = if is_sel {
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -440,9 +649,10 @@ fn render_topology_modal(f: &mut Frame, area: Rect, app: &App) {
                     Span::styled(marker, Style::default().fg(Color::Yellow)),
                     Span::styled(topo.name(), style),
                 ]),
-                Line::from(vec![
-                    Span::styled(format!("    {}", topo.description()), Style::default().fg(Color::DarkGray)),
-                ]),
+                Line::from(vec![Span::styled(
+                    format!("    {}", topo.description()),
+                    Style::default().fg(Color::DarkGray),
+                )]),
             ])
         })
         .collect();
@@ -450,65 +660,101 @@ fn render_topology_modal(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta))
-        .title(Span::styled(" Select Swarm Topology (↑/↓ Enter) ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Select Swarm Topology (↑/↓ Enter) ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
 
     f.render_widget(List::new(items).block(block), popup_area);
 }
 
 fn render_help_modal(f: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(60, 60, area);
+    let popup_area = centered_rect(64, 72, area);
     f.render_widget(Clear, popup_area);
 
+    fn row(keys: &'static str, desc: &'static str) -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                format!("  {:<16}", keys),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(desc, Style::default().fg(Color::Gray)),
+        ])
+    }
+
+    fn section(title: &'static str) -> Line<'static> {
+        Line::from(vec![Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )])
+    }
+
     let lines = vec![
-        Line::from(vec![
-            Span::styled("⚡ Agent Orchestra - Terminal Multi-Agent System", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "⚡ Agent Orchestra — terminal multi-agent runner",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Navigation & Hotkeys:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [i] / [Enter]  ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("Focus prompt input box", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [Esc]          ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("Unfocus input / Close modals", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [Tab] / [1-4]  ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("Switch between Studio, Telemetry, Prompts, Logs", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [t]            ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("Select Swarm Topology (Hierarchical, Pipeline, Debate, Direct)", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [m]            ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("Switch active Local Model (Ollama / llama.cpp / vLLM)", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [c]            ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("Clear workspace transcript", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [j] / [k]      ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("Scroll transcript up / down", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [q] / [Ctrl+C] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("Exit application", Style::default().fg(Color::Gray)),
-        ]),
+        section("Running a goal"),
+        row("i / Enter", "Focus the prompt input"),
+        row("Enter", "Submit the goal and start the pipeline"),
+        row(
+            "Esc",
+            "Unfocus input, close a modal, or cancel a running workflow",
+        ),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Press [Esc] or [Enter] to close this help window.", Style::default().fg(Color::DarkGray)),
-        ]),
+        section("Navigation"),
+        row(
+            "Tab / 1-4",
+            "Studio · Telemetry · Agent Roster · Blackboard",
+        ),
+        row("j / k / ↑ ↓", "Scroll the transcript"),
+        row("PgUp / PgDn", "Scroll by a full page"),
+        row("g / G", "Jump to top / bottom (G re-enables follow mode)"),
+        row("Mouse wheel", "Scroll the transcript"),
+        row("← / →", "Select an agent card"),
+        Line::from(""),
+        section("Configuration"),
+        row("t", "Choose the swarm topology"),
+        row("m", "Change the model (per-agent on the Roster tab)"),
+        row("c", "Clear the transcript"),
+        Line::from(""),
+        section("Editing the prompt"),
+        row("Ctrl+W", "Delete the previous word"),
+        row("Ctrl+U", "Delete to the start of the line"),
+        row("Home / End", "Jump to start / end of the line"),
+        Line::from(""),
+        section("Exit"),
+        row("q / Ctrl+C", "Quit"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Press Esc or Enter to close.",
+            Style::default().fg(Color::DarkGray),
+        )]),
     ];
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightGreen))
-        .title(Span::styled(" Help & Architecture Guide ", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Help ",
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ));
 
-    f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), popup_area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup_area,
+    );
 }

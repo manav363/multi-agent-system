@@ -31,5 +31,6 @@ tokio-util = { version = "0.7", features = ["rt"] }
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# Deliberately NOT panic="abort": agent work runs in spawned tasks, and
+# unwinding lets one bad task die without killing the TUI.
 strip = true

@@ -32,10 +32,6 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
-    pub fn list_tools(&self) -> Vec<Arc<dyn Tool>> {
-        self.tools.values().cloned().collect()
-    }
-
     pub fn tools_for(&self, enabled_names: &[String]) -> Vec<Arc<dyn Tool>> {
         enabled_names
             .iter()

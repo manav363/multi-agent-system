@@ -2,6 +2,7 @@ pub mod agent;
 pub mod events;
 pub mod memory;
 pub mod orchestrator;
+pub mod text;
 
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentConfig, AgentRole};

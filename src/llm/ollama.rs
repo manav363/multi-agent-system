@@ -20,8 +20,14 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn new(endpoint: impl Into<String>) -> Self {
         let endpoint = endpoint.into().trim_end_matches('/').to_string();
+        // `timeout` caps the WHOLE request, which for a streamed response means
+        // a long-but-healthy generation gets killed mid-flight and retried into
+        // the same wall. `read_timeout` bounds the gap between chunks instead,
+        // so a stalled server is still caught while a slow one is allowed to
+        // finish. Local models on CPU routinely need minutes.
         let client = Client::builder()
-            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(120))
             .build()
             .unwrap_or_default();
 
@@ -114,7 +120,10 @@ impl LlmProvider for OllamaProvider {
 
     async fn is_available(&self) -> bool {
         let url = format!("{}/api/tags", self.endpoint);
-        self.client.get(&url).send().await.is_ok()
+        match self.client.get(&url).send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
@@ -147,58 +156,54 @@ impl LlmProvider for OllamaProvider {
         model: &str,
         messages: &[ChatMessage],
         temperature: f32,
-        _max_tokens: Option<usize>,
+        max_tokens: Option<usize>,
         tools: &[Arc<dyn Tool>],
     ) -> Result<ChunkStream> {
         let url = format!("{}/api/chat", self.endpoint);
 
-        // Format messages for Ollama API
-        let mut formatted_messages = Vec::new();
-
-        // Determine if we should try native tool calling
-        // Native tool calling: send tools in the API `tools` field
-        // Fallback: inject tool descriptions into system prompt text
-        let use_native_tools = !tools.is_empty();
-
-        if !use_native_tools && !tools.is_empty() {
-            // Fallback: text-based tool instructions
-            let tools_desc = Self::build_text_tool_instructions(tools);
-            for msg in messages {
-                if msg.role == crate::core::memory::MessageRole::System {
-                    formatted_messages.push(json!({
-                        "role": "system",
-                        "content": format!("{}{}", msg.content, tools_desc)
-                    }));
-                } else {
-                    formatted_messages.push(json!({
-                        "role": msg.role.to_string(),
-                        "content": msg.content
-                    }));
-                }
-            }
+        // Tools travel two ways at once, because a local model tag tells us
+        // nothing about which protocol it honours: the native `tools` field for
+        // models with function-calling training, and a plain-text description
+        // appended to the system prompt for those without. The orchestrator
+        // accepts a call from either channel, so whichever the model speaks lands.
+        let has_tools = !tools.is_empty();
+        let tools_desc = if has_tools {
+            Self::build_text_tool_instructions(tools)
         } else {
-            for msg in messages {
-                formatted_messages.push(json!({
-                    "role": msg.role.to_string(),
-                    "content": msg.content
-                }));
-            }
+            String::new()
+        };
+
+        let mut formatted_messages = Vec::new();
+        for msg in messages {
+            let is_system = msg.role == crate::core::memory::MessageRole::System;
+            let content = if is_system && has_tools {
+                format!("{}{}", msg.content, tools_desc)
+            } else {
+                msg.content.clone()
+            };
+            formatted_messages.push(json!({
+                "role": msg.role.to_string(),
+                "content": content
+            }));
         }
 
-        // Build request body
+        // `num_predict` is the generation cap. Ollama defaults it to -1
+        // (unbounded), so leaving it unset lets a model that falls into a
+        // repetition loop stream until the HTTP timeout fires.
+        let mut options = json!({ "temperature": temperature });
+        if let Some(limit) = max_tokens {
+            options["num_predict"] = json!(limit);
+        }
+
         let mut body = json!({
             "model": model,
             "messages": formatted_messages,
             "stream": true,
-            "options": {
-                "temperature": temperature
-            }
+            "options": options
         });
 
-        // Add native tool schemas if using native tool calling
-        if use_native_tools {
-            let tool_schemas = Self::build_native_tool_schemas(tools);
-            body["tools"] = json!(tool_schemas);
+        if has_tools {
+            body["tools"] = json!(Self::build_native_tool_schemas(tools));
         }
 
         let resp = self
@@ -236,8 +241,7 @@ impl LlmProvider for OllamaProvider {
                                 continue;
                             }
 
-                            if let Ok(parsed) =
-                                serde_json::from_str::<OllamaStreamResponse>(&line)
+                            if let Ok(parsed) = serde_json::from_str::<OllamaStreamResponse>(&line)
                             {
                                 // Extract native tool calls if present
                                 let mut native_tool_calls = Vec::new();
@@ -248,10 +252,8 @@ impl LlmProvider for OllamaProvider {
                                         for tc in tc_list {
                                             if let Some(ref func) = tc.function {
                                                 if let Some(ref name) = func.name {
-                                                    let args = func
-                                                        .arguments
-                                                        .clone()
-                                                        .unwrap_or(json!({}));
+                                                    let args =
+                                                        func.arguments.clone().unwrap_or(json!({}));
                                                     native_tool_calls.push(ToolCall {
                                                         name: name.clone(),
                                                         arguments: args,

@@ -1,10 +1,10 @@
 mod core;
 mod llm;
 mod metrics;
-mod tools;
-mod tui;
 #[cfg(test)]
 mod tests;
+mod tools;
+mod tui;
 
 use anyhow::Result;
 use clap::Parser;
@@ -58,8 +58,7 @@ async fn main() -> Result<()> {
     let args = CliArgs::parse();
 
     // Initialize structured tracing (only to stderr to avoid TUI interference)
-    let filter = EnvFilter::try_new(&args.log_level)
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_new(&args.log_level).unwrap_or_else(|_| EnvFilter::new("warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
@@ -73,10 +72,26 @@ async fn main() -> Result<()> {
     // 2. Select LLM Provider
     let provider: Arc<dyn LlmProvider> = match args.provider.to_lowercase().as_str() {
         "ollama" => Arc::new(OllamaProvider::new(&args.endpoint)),
-        "llamacpp" => Arc::new(OpenAiCompatProvider::new("llama.cpp Server", &args.endpoint, args.api_key)),
-        "vllm" => Arc::new(OpenAiCompatProvider::new("vLLM Server", &args.endpoint, args.api_key)),
-        "lmstudio" => Arc::new(OpenAiCompatProvider::new("LM Studio", &args.endpoint, args.api_key)),
-        "openai" => Arc::new(OpenAiCompatProvider::new("OpenAI-Compatible", &args.endpoint, args.api_key)),
+        "llamacpp" => Arc::new(OpenAiCompatProvider::new(
+            "llama.cpp Server",
+            &args.endpoint,
+            args.api_key,
+        )),
+        "vllm" => Arc::new(OpenAiCompatProvider::new(
+            "vLLM Server",
+            &args.endpoint,
+            args.api_key,
+        )),
+        "lmstudio" => Arc::new(OpenAiCompatProvider::new(
+            "LM Studio",
+            &args.endpoint,
+            args.api_key,
+        )),
+        "openai" => Arc::new(OpenAiCompatProvider::new(
+            "OpenAI-Compatible",
+            &args.endpoint,
+            args.api_key,
+        )),
         _ => Arc::new(OllamaProvider::new(&args.endpoint)),
     };
 
@@ -89,16 +104,48 @@ async fn main() -> Result<()> {
 
     // 3. Headless / CLI Benchmark Mode
     if let Some(prompt) = args.prompt {
-        run_headless_mode(provider, tools, &args.model, args.planner_model.as_deref(), topology_mode, &prompt).await?;
+        run_headless_mode(
+            provider,
+            tools,
+            &args.model,
+            args.planner_model.as_deref(),
+            topology_mode,
+            &prompt,
+        )
+        .await?;
         return Ok(());
     }
 
     // 4. Interactive Terminal UI Mode
+    install_panic_hook();
     let terminal = ratatui::init();
+    enable_mouse();
     let app_result = run_app(terminal, provider, tools, &args.model).await;
-    ratatui::restore();
+    restore_terminal();
 
     app_result
+}
+
+/// Put the terminal back before a panic message is printed.
+///
+/// Without this a panic anywhere in the app leaves the terminal in raw mode on
+/// the alternate screen — no echo, no line editing, and the backtrace scribbled
+/// over the TUI. The user's only way out is `reset`.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+}
+
+fn enable_mouse() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+}
+
+fn restore_terminal() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    ratatui::restore();
 }
 
 async fn run_app(
@@ -120,6 +167,14 @@ async fn run_headless_mode(
     prompt: &str,
 ) -> Result<()> {
     let planner_model = planner_model_opt.unwrap_or(coder_model);
+
+    if !provider.is_available().await {
+        anyhow::bail!(
+            "{} at {} is not responding. Start the server and retry.",
+            provider.name(),
+            provider.endpoint()
+        );
+    }
 
     println!("⚡ AGENT ORCHESTRA (Headless Mode)");
     println!("├─ Provider:      {}", provider.name());
@@ -143,18 +198,26 @@ async fn run_headless_mode(
     );
 
     let prompt_owned = prompt.to_string();
-    let orchestrator_task = tokio::spawn(async move {
-        orchestrator.execute_goal(&prompt_owned).await
-    });
+    let orchestrator_task =
+        tokio::spawn(async move { orchestrator.execute_goal(&prompt_owned).await });
 
-    let mut total_tokens = 0;
     while let Some(event) = rx.recv().await {
         match event {
-            core::events::OrchestratorEvent::WorkflowStepStarted { step_index, title, agent_id, .. } => {
-                println!("\n▶ [Step {}] {} (Agent: {})", step_index, title, agent_id);
+            core::events::OrchestratorEvent::WorkflowStepStarted {
+                step_index,
+                total_steps,
+                title,
+                agent_id,
+                ..
+            } => {
+                println!(
+                    "\n▶ [Step {}/{}] {} (Agent: {})",
+                    step_index, total_steps, title, agent_id
+                );
             }
-            core::events::OrchestratorEvent::AgentTokenChunk { delta, is_thought, .. } => {
-                total_tokens += 1;
+            core::events::OrchestratorEvent::AgentTokenChunk {
+                delta, is_thought, ..
+            } => {
                 if is_thought {
                     print!("\x1b[90m{}\x1b[0m", delta);
                 } else {
@@ -163,16 +226,44 @@ async fn run_headless_mode(
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
-            core::events::OrchestratorEvent::ToolCallStarted { tool_name, args, .. } => {
+            core::events::OrchestratorEvent::ToolCallStarted {
+                tool_name, args, ..
+            } => {
                 println!("\n  🛠️  [Tool Call: {}] Args: {}", tool_name, args);
             }
-            core::events::OrchestratorEvent::ToolCallFinished { tool_name, duration_ms, is_error, .. } => {
-                println!("  ✓ [Tool {}] Completed in {}ms (Error: {})", tool_name, duration_ms, is_error);
+            core::events::OrchestratorEvent::ToolCallFinished {
+                tool_name,
+                duration_ms,
+                is_error,
+                ..
+            } => {
+                println!(
+                    "  ✓ [Tool {}] Completed in {}ms (Error: {})",
+                    tool_name, duration_ms, is_error
+                );
             }
-            core::events::OrchestratorEvent::WorkflowOverallCompleted { total_duration_ms, topology, .. } => {
+            core::events::OrchestratorEvent::WorkflowOverallCompleted {
+                total_duration_ms,
+                total_tokens,
+                topology,
+                ..
+            } => {
                 println!("\n\n══════════════════════════════════════════════════════════════");
-                println!("✓ Workflow ({}) Completed in {:.2}s | Streamed Tokens: {}", topology, total_duration_ms as f64 / 1000.0, total_tokens);
+                println!(
+                    "✓ Workflow ({}) completed in {:.2}s | {} tokens",
+                    topology,
+                    total_duration_ms as f64 / 1000.0,
+                    total_tokens
+                );
                 println!("══════════════════════════════════════════════════════════════");
+            }
+            core::events::OrchestratorEvent::SystemLog {
+                level,
+                target,
+                message,
+                ..
+            } if level != "INFO" => {
+                eprintln!("\n[{}] {}: {}", level, target, message);
             }
             _ => {}
         }

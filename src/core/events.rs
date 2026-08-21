@@ -54,6 +54,9 @@ pub enum OrchestratorEvent {
     ToolCallFinished {
         agent_id: String,
         tool_name: String,
+        /// Correlates with `ToolCallStarted.call_id`. Two calls to the same tool
+        /// in one step are indistinguishable by name alone.
+        call_id: String,
         result: String,
         is_error: bool,
         duration_ms: u64,
@@ -71,6 +74,11 @@ pub enum OrchestratorEvent {
         title: String,
         agent_id: String,
         duration_ms: u64,
+        /// Milliseconds from workflow start to this step's start, so the
+        /// telemetry waterfall can place bars instead of stacking them at zero.
+        start_offset_ms: u64,
+        tokens: usize,
+        tool_calls: usize,
         success: bool,
         output_preview: String,
         timestamp: DateTime<Utc>,

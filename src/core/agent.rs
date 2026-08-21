@@ -215,6 +215,7 @@ impl Agent {
     }
 
     pub fn clear_history(&mut self) {
-        self.history.retain(|msg| msg.role == crate::core::memory::MessageRole::System);
+        self.history
+            .retain(|msg| msg.role == crate::core::memory::MessageRole::System);
     }
 }

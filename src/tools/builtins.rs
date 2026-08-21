@@ -1,56 +1,215 @@
+use crate::core::text::truncate_chars;
 use crate::tools::tool::{Tool, ToolRegistry};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use regex::Regex;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-/// Bash Command Execution Tool (sandboxed)
+/// Shell command execution behind a deny-list guard.
+///
+/// ponytail: this is a deny-list, NOT a sandbox. It stops an agent from
+/// wandering into an obviously destructive command; it does not contain a
+/// determined one (a script file, base64, or an interpreter one-liner all walk
+/// straight past it). Run the binary under a container, a dedicated user, or
+/// seccomp if you need a real boundary.
 pub struct BashCommandTool;
 
-/// Commands/patterns that are blocked for safety
-const BLOCKED_PATTERNS: &[&str] = &[
-    "rm -rf /",
-    "rm -rf /*",
-    "rm -rf ~",
-    "mkfs",
-    "dd if=",
-    "> /dev/sd",
-    "> /dev/nvme",
-    "chmod 777",
-    "chmod -R 777",
-    ":(){ :|:",           // fork bomb
-    "curl|sh", "curl |sh", "curl| sh", "curl | sh",
-    "wget|sh", "wget |sh", "wget| sh", "wget | sh",
-    "curl|bash", "curl |bash", "curl| bash", "curl | bash",
-    "wget|bash", "wget |bash", "wget| bash", "wget | bash",
-    "/etc/shadow",
-    "/etc/passwd",
-    "shutdown",
-    "reboot",
-    "init 0",
-    "init 6",
-    "systemctl poweroff",
-    "systemctl reboot",
-];
-
-/// Max output size in bytes to prevent memory exhaustion
-const MAX_OUTPUT_BYTES: usize = 64_000;
+/// Max output characters kept from a command, to bound memory.
+const MAX_OUTPUT_CHARS: usize = 64_000;
 
 /// Default timeout in seconds
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-fn is_command_blocked(command: &str) -> Option<&'static str> {
-    let lower = command.to_lowercase();
-    for pattern in BLOCKED_PATTERNS {
-        if lower.contains(&pattern.to_lowercase()) {
-            return Some(pattern);
+/// Paths that must never be the target of a recursive delete.
+const PROTECTED_PATHS: &[&str] = &[
+    "/",
+    "/*",
+    "~",
+    "~/",
+    "$home",
+    "$pwd",
+    ".",
+    "./",
+    "..",
+    "../",
+    "*",
+    "/etc",
+    "/usr",
+    "/var",
+    "/bin",
+    "/sbin",
+    "/boot",
+    "/lib",
+    "/opt",
+    "/dev",
+    "/system",
+    "/library",
+    "/users",
+    "/home",
+    "/root",
+    "/applications",
+];
+
+/// Directories a command must not be launched from.
+const RESTRICTED_CWDS: &[&str] = &[
+    "/etc",
+    "/var",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/boot",
+    "/dev",
+    "/root",
+    "/System",
+    "/Library",
+    "/private/etc",
+    "/Applications",
+];
+
+struct DenyRule {
+    pattern: Regex,
+    reason: &'static str,
+}
+
+/// Deny rules run against the *normalised* command, so extra whitespace and
+/// capitalisation cannot slip a match — `RM  -RF  /` reads the same as `rm -rf /`.
+fn deny_rules() -> &'static [DenyRule] {
+    static RULES: OnceLock<Vec<DenyRule>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        let raw: &[(&str, &'static str)] = &[
+            (r"\bmkfs(\.\w+)?\b", "filesystem format"),
+            (r"\bdd\b[^|;&]*\bof=/dev/", "raw write to a block device"),
+            (
+                r">\s*/dev/(sd|nvme|disk|hd)",
+                "redirect onto a block device",
+            ),
+            // Pipe-to-shell in any spacing, with or without flags.
+            (
+                r"\b(curl|wget|fetch)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|k|da|c|fi)?sh\b",
+                "piping a download straight into a shell",
+            ),
+            (r":\s*\(\s*\)\s*\{.*\|.*&\s*\}", "fork bomb"),
+            (r"\bchmod\b[^|;&]*\s0?777\b", "world-writable permissions"),
+            (
+                r"\bchown\b[^|;&]*\s-r\b[^|;&]*\s/(etc|usr|bin|var)\b",
+                "recursive ownership change of a system path",
+            ),
+            (
+                r"/etc/(shadow|sudoers|passwd)\b",
+                "access to a system credential file",
+            ),
+            (
+                r"(~|\$home)/\.(ssh|aws|gnupg)/",
+                "access to stored credentials",
+            ),
+            (r"\bid_(rsa|ed25519|ecdsa)\b", "access to a private key"),
+            (
+                r"\b(shutdown|reboot|halt|poweroff)\b",
+                "host power state change",
+            ),
+            (r"\binit\s+[06]\b", "host runlevel change"),
+            (
+                r"\bsystemctl\s+(poweroff|reboot|halt)\b",
+                "host power state change",
+            ),
+            (r"\b(sudo|doas)\b", "privilege escalation"),
+            (r"\bhistory\s+-c\b", "shell history tampering"),
+            (r"\bcrontab\b[^|;&]*\s-r\b", "removing scheduled jobs"),
+        ];
+        raw.iter()
+            .map(|(p, reason)| DenyRule {
+                // A malformed rule is a build-time mistake, not a runtime
+                // condition: failing loudly beats silently dropping a guard.
+                pattern: Regex::new(p).unwrap_or_else(|e| panic!("bad deny rule {p:?}: {e}")),
+                reason,
+            })
+            .collect()
+    })
+}
+
+/// Lowercase and collapse whitespace runs, so spacing tricks cannot hide a match.
+fn normalize_command(command: &str) -> String {
+    command
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Split on shell separators so each rule sees one command at a time.
+fn command_segments(normalized: &str) -> Vec<&str> {
+    normalized
+        .split([';', '|', '&', '\n'])
+        .map(str::trim)
+        .filter(|seg| !seg.is_empty())
+        .collect()
+}
+
+/// Catch a recursive delete aimed at anything important.
+///
+/// A substring check for the literal `"rm -rf /"` misses `rm  -rf /`,
+/// `rm -fr /`, `rm -r -f /` and `rm --recursive /` — all of which do the same
+/// damage. Parsing the flags and targets covers the whole family instead.
+fn dangerous_recursive_delete(normalized: &str) -> Option<&'static str> {
+    for segment in command_segments(normalized) {
+        let mut tokens = segment.split_whitespace().peekable();
+
+        // Step over environment assignments and command prefixes.
+        let program = loop {
+            match tokens.next() {
+                Some(t)
+                    if t.contains('=')
+                        || matches!(t, "sudo" | "command" | "time" | "nohup" | "exec") =>
+                {
+                    continue
+                }
+                Some(t) => break t,
+                None => break "",
+            }
+        };
+        if program != "rm" && !program.ends_with("/rm") {
+            continue;
+        }
+
+        let args: Vec<&str> = tokens.collect();
+        let recursive = args.iter().any(|a| {
+            *a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && a.contains('r'))
+        });
+        if !recursive {
+            continue;
+        }
+
+        for target in args.iter().filter(|a| !a.starts_with('-')) {
+            let clean = target.trim_matches(|c| c == '"' || c == '\'');
+            let stripped = clean.strip_suffix('/').unwrap_or(clean);
+            if PROTECTED_PATHS
+                .iter()
+                .any(|p| clean == *p || stripped == p.trim_end_matches('/'))
+            {
+                return Some("recursive delete of a protected path");
+            }
         }
     }
     None
+}
+
+fn is_command_blocked(command: &str) -> Option<&'static str> {
+    let normalized = normalize_command(command);
+
+    if let Some(reason) = dangerous_recursive_delete(&normalized) {
+        return Some(reason);
+    }
+
+    deny_rules()
+        .iter()
+        .find(|rule| rule.pattern.is_match(&normalized))
+        .map(|rule| rule.reason)
 }
 
 #[async_trait]
@@ -90,33 +249,32 @@ impl Tool for BashCommandTool {
             .and_then(|v| v.as_str())
             .context("Missing 'command' parameter")?;
 
-        // Safety: check against blocked patterns
-        if let Some(blocked) = is_command_blocked(command_str) {
+        if let Some(reason) = is_command_blocked(command_str) {
             anyhow::bail!(
-                "🛡️ Command blocked for safety. Matched pattern: '{}'. This tool restricts destructive and dangerous operations.",
-                blocked
+                "🛡️ Command blocked for safety ({}). Rephrase without the destructive operation.",
+                reason
             );
         }
 
         let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
 
-        // Safety: prevent path traversal to sensitive directories
-        let cwd_path = Path::new(cwd);
-        if let Ok(canonical) = cwd_path.canonicalize() {
-            let canonical_str = canonical.to_string_lossy();
-            if canonical_str.starts_with("/etc")
-                || canonical_str.starts_with("/var")
-                || canonical_str.starts_with("/usr")
-                || canonical_str.starts_with("/bin")
-                || canonical_str.starts_with("/sbin")
-                || canonical_str.starts_with("/boot")
-                || canonical_str.starts_with("/root")
-            {
-                anyhow::bail!(
-                    "🛡️ Working directory '{}' is in a restricted system path. Use a project directory instead.",
-                    canonical_str
-                );
-            }
+        // Resolve the working directory before use. A path that cannot be
+        // canonicalised is rejected rather than waved through — the old code
+        // skipped the whole check on failure, so a non-existent `cwd` bypassed it.
+        let canonical = Path::new(cwd)
+            .canonicalize()
+            .with_context(|| format!("Working directory '{}' does not exist", cwd))?;
+        if !canonical.is_dir() {
+            anyhow::bail!("Working directory '{}' is not a directory", cwd);
+        }
+        if RESTRICTED_CWDS
+            .iter()
+            .any(|restricted| canonical.starts_with(restricted))
+        {
+            anyhow::bail!(
+                "🛡️ Working directory '{}' is a restricted system path. Use a project directory instead.",
+                canonical.display()
+            );
         }
 
         let timeout_secs = args
@@ -127,7 +285,7 @@ impl Tool for BashCommandTool {
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command_str);
-        cmd.current_dir(cwd);
+        cmd.current_dir(&canonical);
 
         let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
             .await
@@ -139,9 +297,9 @@ impl Tool for BashCommandTool {
         let exit_code = output.status.code().unwrap_or(-1);
 
         // Cap output size to prevent memory exhaustion
-        let stdout: String = stdout_raw.chars().take(MAX_OUTPUT_BYTES).collect();
-        let stderr: String = stderr_raw.chars().take(MAX_OUTPUT_BYTES / 4).collect();
-        let was_truncated = stdout_raw.len() > MAX_OUTPUT_BYTES || stderr_raw.len() > MAX_OUTPUT_BYTES / 4;
+        let stdout = truncate_chars(&stdout_raw, MAX_OUTPUT_CHARS);
+        let stderr = truncate_chars(&stderr_raw, MAX_OUTPUT_CHARS / 4);
+        let was_truncated = stdout.len() != stdout_raw.len() || stderr.len() != stderr_raw.len();
 
         let mut res = String::new();
         if !stdout.is_empty() {
@@ -219,7 +377,10 @@ impl Tool for ReadFileTool {
             .unwrap_or(total_lines);
 
         if start >= total_lines {
-            return Ok(format!("File has {} lines. start_line is beyond EOF.", total_lines));
+            return Ok(format!(
+                "File has {} lines. start_line is beyond EOF.",
+                total_lines
+            ));
         }
 
         let slice = &lines[start..end.min(total_lines)];
@@ -284,7 +445,11 @@ impl Tool for WriteFileTool {
             .await
             .with_context(|| format!("Failed to write file: {}", path_str))?;
 
-        Ok(format!("Successfully wrote {} bytes to {}", content.len(), path_str))
+        Ok(format!(
+            "Successfully wrote {} bytes to {}",
+            content.len(),
+            path_str
+        ))
     }
 }
 
@@ -334,6 +499,12 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.as_str())
             .context("Missing 'url' parameter")?;
 
+        // Validate the scheme at the boundary: reqwest will happily follow a
+        // `file://` URL, turning a network tool into an arbitrary file reader.
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            anyhow::bail!("Only http:// and https:// URLs are allowed (got: {})", url);
+        }
+
         let resp = self
             .client
             .get(url)
@@ -348,8 +519,11 @@ impl Tool for WebFetchTool {
             .with_context(|| format!("Failed to read response body from {}", url))?;
 
         // Truncate to reasonable context window if needed
-        let truncated: String = body.chars().take(8000).collect();
-        Ok(format!("Status: {}\n\nContent:\n{}", status, truncated))
+        Ok(format!(
+            "Status: {}\n\nContent:\n{}",
+            status,
+            truncate_chars(&body, 8000)
+        ))
     }
 }
 
@@ -386,10 +560,7 @@ impl Tool for CalculatorTool {
             .context("Missing 'expression' parameter")?;
 
         // Normalize common patterns LLMs might use
-        let normalized = expr
-            .replace("×", "*")
-            .replace("÷", "/")
-            .replace("**", "^");
+        let normalized = expr.replace("×", "*").replace("÷", "/").replace("**", "^");
 
         match meval::eval_str(&normalized) {
             Ok(result) => Ok(format!("Result: {}", result)),

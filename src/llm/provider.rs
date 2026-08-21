@@ -6,7 +6,6 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -24,22 +23,6 @@ pub struct LlmStreamChunk {
     /// Structured tool calls from native provider protocol (Ollama/OpenAI function_calling)
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct LlmMetrics {
-    pub ttft: Duration,
-    pub total_duration: Duration,
-    pub prompt_eval_tokens: usize,
-    pub completion_tokens: usize,
-    pub tokens_per_second: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct LlmCompletion {
-    pub content: String,
-    pub thoughts: Option<String>,
-    pub metrics: LlmMetrics,
 }
 
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<LlmStreamChunk>> + Send>>;

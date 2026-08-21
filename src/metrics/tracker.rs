@@ -19,7 +19,6 @@ pub struct WaterfallSpan {
 
 #[derive(Debug, Clone)]
 pub struct AgentLiveMetrics {
-    pub agent_id: String,
     pub start_instant: Option<Instant>,
     pub first_token_instant: Option<Instant>,
     pub last_token_instant: Option<Instant>,
@@ -32,10 +31,15 @@ pub struct AgentLiveMetrics {
     pub total_tool_duration_ms: u64,
 }
 
+impl Default for AgentLiveMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentLiveMetrics {
-    pub fn new(agent_id: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         Self {
-            agent_id: agent_id.into(),
             start_instant: None,
             first_token_instant: None,
             last_token_instant: None,
@@ -133,9 +137,7 @@ impl MetricsTracker {
     }
 
     pub fn get_or_create_agent(&mut self, agent_id: &str) -> &mut AgentLiveMetrics {
-        self.agent_metrics
-            .entry(agent_id.to_string())
-            .or_insert_with(|| AgentLiveMetrics::new(agent_id))
+        self.agent_metrics.entry(agent_id.to_string()).or_default()
     }
 
     pub fn on_agent_start(&mut self, agent_id: &str) {
@@ -153,6 +155,31 @@ impl MetricsTracker {
         if self.tps_history.len() > 60 {
             self.tps_history.pop_front();
         }
+    }
+
+    /// Replace the streamed estimate with the provider's own token count.
+    ///
+    /// Live counting increments once per stream chunk, which tracks closely for
+    /// one-token chunks but drifts whenever a backend batches them. When the
+    /// provider reports real usage, that number wins and the workflow total is
+    /// adjusted by the difference rather than double-counted.
+    pub fn reconcile_agent_tokens(&mut self, agent_id: &str, authoritative_total: usize) {
+        let agent = self.get_or_create_agent(agent_id);
+        let previous = agent.total_tokens;
+        agent.total_tokens = authoritative_total;
+
+        // Recompute average throughput against the corrected count.
+        if let (Some(first), Some(last)) = (agent.first_token_instant, agent.last_token_instant) {
+            let secs = last.duration_since(first).as_secs_f64();
+            if secs > 0.05 {
+                agent.avg_tps = authoritative_total as f64 / secs;
+            }
+        }
+
+        self.total_workflow_tokens = self
+            .total_workflow_tokens
+            .saturating_sub(previous)
+            .saturating_add(authoritative_total);
     }
 
     pub fn on_tool_finished(&mut self, agent_id: &str, duration_ms: u64) {
