@@ -3,17 +3,19 @@ use crate::core::events::{AgentStatus, OrchestratorEvent};
 use crate::core::memory::SharedBlackboard;
 use crate::core::prompt::{fit, Section, ARTIFACT_PRIORITY};
 use crate::core::text::{
-    distill_answer, estimate_tokens, preview_line, truncate_chars, RepetitionGuard,
+    distill_answer, estimate_tokens, extract_files, preview_line, truncate_chars, RepetitionGuard,
 };
 use crate::core::topology::{ReviewLoop, StepSpec, TopologyMode};
 use crate::llm::provider::{ChatOptions, LlmProvider, ToolCall};
 use crate::tools::coordination::{BlackboardReadTool, BlackboardWriteTool, ConsultAgentTool};
-use crate::tools::tool::ToolRegistry;
+use crate::tools::tool::{Tool, ToolRegistry};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
 use regex::Regex;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
@@ -55,6 +57,7 @@ struct StepRunner {
     total_steps: usize,
     workflow_start: Instant,
     context_tokens: usize,
+    files_written: Arc<AtomicUsize>,
 }
 
 impl StepRunner {
@@ -431,6 +434,10 @@ impl StepRunner {
             Err(e) => (format!("Tool execution error: {e}"), true),
         };
 
+        if !is_error && call.name == "write_file" {
+            self.files_written.fetch_add(1, Ordering::Relaxed);
+        }
+
         self.emit(OrchestratorEvent::ToolCallFinished {
             agent_id: agent_id.to_string(),
             tool_name: call.name.clone(),
@@ -501,6 +508,10 @@ pub struct Orchestrator {
     workflow_start: Option<Instant>,
     /// Every step's output in completion order — the record a session is built from.
     step_outputs: Vec<(String, String)>,
+    /// Where a recovered deliverable is written when no agent saved one.
+    workspace: Option<PathBuf>,
+    /// Files the workflow saved, so the fallback only runs when nothing did.
+    files_written: Arc<AtomicUsize>,
 }
 
 impl Orchestrator {
@@ -530,6 +541,8 @@ impl Orchestrator {
             agent_token_totals: HashMap::new(),
             workflow_start: None,
             step_outputs: Vec::new(),
+            workspace: None,
+            files_written: Arc::new(AtomicUsize::new(0)),
         };
         orchestrator.register_coordination_tools();
         orchestrator
@@ -558,6 +571,12 @@ impl Orchestrator {
     pub fn with_blackboard(mut self, blackboard: SharedBlackboard) -> Self {
         self.blackboard = blackboard;
         self.register_coordination_tools();
+        self
+    }
+
+    /// Where a deliverable is recovered to when no agent wrote one itself.
+    pub fn with_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+        self.workspace = Some(workspace.into());
         self
     }
 
@@ -597,6 +616,7 @@ impl Orchestrator {
             total_steps: self.topology.max_steps(),
             workflow_start: self.workflow_start.unwrap_or_else(Instant::now),
             context_tokens: self.context_tokens,
+            files_written: self.files_written.clone(),
         }
     }
 
@@ -649,6 +669,8 @@ impl Orchestrator {
             .get(self.topology.terminal_step())
             .cloned()
             .unwrap_or_else(|| "No output produced.".to_string());
+
+        self.recover_deliverable(user_goal, &final_output).await;
 
         self.emit(OrchestratorEvent::WorkflowOverallCompleted {
             topology: self.topology.name().to_string(),
@@ -924,6 +946,56 @@ impl Orchestrator {
         }
 
         fitted.text
+    }
+
+    /// Save the deliverable when no agent called `write_file`.
+    ///
+    /// Producing artifacts rather than a transcript is the point of the run, and
+    /// whether a small model remembers to call a tool should not decide it. The
+    /// files are recovered from the final answer's labelled code blocks.
+    async fn recover_deliverable(&self, user_goal: &str, final_output: &str) {
+        let Some(workspace) = &self.workspace else {
+            return;
+        };
+        if self.files_written.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+
+        // A filename in the goal ("save it as src/lru.rs") names a lone block.
+        let default_path = crate::core::text::filename_hint(user_goal)
+            .unwrap_or_else(|| "deliverable.txt".to_string());
+        let files = extract_files(final_output, &default_path);
+        if files.is_empty() {
+            return;
+        }
+
+        let writer = crate::tools::builtins::WriteFileTool::new(workspace.clone());
+        let mut saved = Vec::new();
+        for file in files {
+            let args = serde_json::json!({ "path": file.path, "content": file.content });
+            match writer.execute(args).await {
+                Ok(_) => saved.push(file.path),
+                Err(e) => self.emit(OrchestratorEvent::SystemLog {
+                    level: "WARN".to_string(),
+                    target: "Deliverable".to_string(),
+                    message: format!("Could not save {}: {e:#}", file.path),
+                    timestamp: Utc::now(),
+                }),
+            }
+        }
+
+        if !saved.is_empty() {
+            self.emit(OrchestratorEvent::SystemLog {
+                level: "INFO".to_string(),
+                target: "Deliverable".to_string(),
+                message: format!(
+                    "No agent saved a file, so the deliverable was recovered to {}: {}",
+                    workspace.display(),
+                    saved.join(", ")
+                ),
+                timestamp: Utc::now(),
+            });
+        }
     }
 
     fn check_cancelled(&self) -> Result<()> {

@@ -53,6 +53,13 @@ const MIN_DELIVERABLE_CHARS: usize = 120;
 /// its code is worth keeping, so the whole answer is returned unless the fenced
 /// blocks are outweighed by the talking around them.
 pub fn distill_answer(text: &str) -> String {
+    // An agent asked for structured output announces itself with a section
+    // header. Anything before the first one is throat-clearing — and small
+    // reasoning models reliably recite the instructions back before complying.
+    if let Some(idx) = structured_start(text) {
+        return text[idx..].trim().to_string();
+    }
+
     let blocks = fenced_blocks(text);
     if blocks.is_empty() {
         return text.to_string();
@@ -77,6 +84,148 @@ pub fn distill_answer(text: &str) -> String {
     };
 
     best.trim().to_string()
+}
+
+/// A file the deliverable contains, recovered from the final answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedFile {
+    pub path: String,
+    pub content: String,
+}
+
+/// Recover the files a deliverable describes from its fenced code blocks.
+///
+/// The Synthesizer is told to call `write_file`, and small models often simply
+/// do not. Since producing artifacts rather than transcripts is the point, the
+/// orchestrator falls back to this: take the code blocks and the filename each
+/// one is labelled with. A block with no discernible name is skipped rather
+/// than guessed at, except for the single-block case where the goal's own
+/// filename is the obvious answer.
+pub fn extract_files(text: &str, default_path: &str) -> Vec<ExtractedFile> {
+    let mut files = Vec::new();
+    let mut pending_name: Option<String> = None;
+    let mut current: Option<String> = None;
+    let mut recent_lines: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("```") {
+            match current.take() {
+                Some(body) => {
+                    let path = pending_name
+                        .take()
+                        .or_else(|| recent_lines.iter().rev().find_map(|l| filename_in(l)));
+                    if let Some(path) = path {
+                        files.push(ExtractedFile {
+                            path,
+                            content: body,
+                        });
+                    } else {
+                        files.push(ExtractedFile {
+                            path: String::new(),
+                            content: body,
+                        });
+                    }
+                    recent_lines.clear();
+                }
+                None => {
+                    // A fence may carry the name itself: ```rust src/lru.rs
+                    pending_name = filename_in(trimmed.trim_start_matches('`'));
+                    current = Some(String::new());
+                }
+            }
+            continue;
+        }
+
+        match current.as_mut() {
+            Some(body) => {
+                body.push_str(line);
+                body.push('\n');
+            }
+            None => {
+                if !trimmed.is_empty() {
+                    recent_lines.push(trimmed.to_string());
+                    if recent_lines.len() > 4 {
+                        recent_lines.remove(0);
+                    }
+                }
+            }
+        }
+    }
+
+    // An unclosed final block still holds the deliverable.
+    if let Some(body) = current {
+        if !body.trim().is_empty() {
+            let path = pending_name
+                .or_else(|| recent_lines.iter().rev().find_map(|l| filename_in(l)))
+                .unwrap_or_default();
+            files.push(ExtractedFile {
+                path,
+                content: body,
+            });
+        }
+    }
+
+    files.retain(|f| !f.content.trim().is_empty());
+
+    // Exactly one unnamed block is the deliverable the goal asked for.
+    if files.len() == 1 && files[0].path.is_empty() {
+        files[0].path = default_path.to_string();
+    }
+    files.retain(|f| !f.path.is_empty());
+    files
+}
+
+/// A filename mentioned in the user's goal, e.g. "save it as src/lru.rs".
+pub fn filename_hint(goal: &str) -> Option<String> {
+    filename_in(goal)
+}
+
+/// A source filename mentioned in a line of prose, fence tag or comment.
+fn filename_in(line: &str) -> Option<String> {
+    const EXTENSIONS: &[&str] = &[
+        ".rs", ".py", ".ts", ".tsx", ".js", ".go", ".java", ".c", ".h", ".cpp", ".hpp", ".rb",
+        ".sh", ".toml", ".json", ".yaml", ".yml", ".md", ".sql",
+    ];
+
+    line.split(|c: char| c.is_whitespace() || "`*_()[]<>\"',;:".contains(c))
+        .map(|t| t.trim_start_matches("./"))
+        .find(|token| {
+            EXTENSIONS.iter().any(|e| token.ends_with(e))
+                && token.len() > 3
+                && !token.starts_with('-')
+                && !token.contains("..")
+        })
+        .map(|t| t.to_string())
+}
+
+/// Preamble this long before a section header counts as throat-clearing.
+const MIN_PREAMBLE_CHARS: usize = 120;
+
+/// Byte offset of the first ALL-CAPS section header that has prose before it.
+///
+/// Matches a line that is entirely an upper-case label ending in a colon —
+/// `SIGNATURES:`, `FINDINGS:`, `EDGE CASES:` — which is how the structured
+/// agents are told to open. Returns `None` when the output already starts with
+/// its header, so compliant answers are left untouched.
+fn structured_start(text: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let is_header = trimmed.len() >= 4
+            && trimmed.ends_with(':')
+            && trimmed[..trimmed.len() - 1]
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == ' ' || c == '_' || c == '-')
+            && trimmed.chars().any(|c| c.is_ascii_uppercase());
+
+        if is_header {
+            return (offset >= MIN_PREAMBLE_CHARS).then_some(offset);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 /// Contents of every ``` fenced block, ignoring the language tag.
@@ -289,6 +438,130 @@ mod tests {
         assert!(distilled.starts_with("pub fn fib"));
         assert!(!distilled.contains("Okay, I need"));
         assert!(!distilled.contains("Wait, but"));
+    }
+
+    /// What qwen3:4b actually produced: it recited the output format back
+    /// before complying with it.
+    #[test]
+    fn narration_before_a_section_header_is_dropped() {
+        let output = "We are designing a lock-free LRU cache in Rust.\n\n\
+                      Important constraints:\n- Lock-free, so atomics and CAS\n\
+                      - We are to output only the specified sections.\n\n\
+                      Rules:\n- Scale to the request, no invented files.\n\n\
+                      SIGNATURES:\n- pub fn get(&self, k: &K) -> Option<V>\n\
+                      STEPS:\n1. Build the ring buffer\n";
+
+        let distilled = distill_answer(output);
+        assert!(distilled.starts_with("SIGNATURES:"));
+        assert!(!distilled.contains("We are designing"));
+        assert!(distilled.contains("STEPS:"), "later sections must survive");
+    }
+
+    #[test]
+    fn a_filename_is_recognised_in_the_goal_text() {
+        assert_eq!(
+            filename_hint("Implement a lock-free LRU cache. Save it as src/lru.rs"),
+            Some("src/lru.rs".to_string())
+        );
+        assert_eq!(
+            filename_hint("Write a fibonacci function, save as `fib.rs`"),
+            Some("fib.rs".to_string())
+        );
+        assert_eq!(filename_hint("Explain the Raft consensus algorithm"), None);
+    }
+
+    #[test]
+    fn a_labelled_block_is_recovered_with_its_filename() {
+        let deliverable = "Here is the implementation:\n\n\
+                           **src/lru.rs**\n\
+                           ```rust\n\
+                           pub struct Lru;\n\
+                           ```\n";
+        let files = extract_files(deliverable, "deliverable.rs");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/lru.rs");
+        assert!(files[0].content.contains("pub struct Lru"));
+    }
+
+    #[test]
+    fn a_filename_on_the_fence_itself_is_used() {
+        let d = "```rust src/cache.rs\npub fn get() {}\n```";
+        assert_eq!(extract_files(d, "x.rs")[0].path, "src/cache.rs");
+    }
+
+    #[test]
+    fn a_leading_path_comment_names_the_file() {
+        let d = "```rust\n// src/fib.rs\npub fn fib() {}\n```";
+        // The comment is inside the block, so the fallback name applies.
+        assert_eq!(extract_files(d, "fib.rs")[0].path, "fib.rs");
+    }
+
+    #[test]
+    fn a_single_unlabelled_block_takes_the_goals_filename() {
+        let d = "Here it is:\n```rust\npub fn fib(n: u32) -> u32 { n }\n```\nDone.";
+        let files = extract_files(d, "src/fib.rs");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/fib.rs");
+    }
+
+    #[test]
+    fn several_labelled_blocks_are_all_recovered() {
+        let d =
+            "src/lib.rs\n```rust\npub mod cache;\n```\n\nsrc/cache.rs\n```rust\npub struct C;\n```";
+        let files = extract_files(d, "fallback.rs");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/lib.rs");
+        assert_eq!(files[1].path, "src/cache.rs");
+    }
+
+    #[test]
+    fn unnamed_blocks_among_named_ones_are_skipped_not_guessed() {
+        let d = "```\nsome shell output\n```\n\nsrc/real.rs\n```rust\npub fn f() {}\n```";
+        let files = extract_files(d, "fallback.rs");
+        assert_eq!(files.len(), 1, "only the named block is a file");
+        assert_eq!(files[0].path, "src/real.rs");
+    }
+
+    #[test]
+    fn prose_with_no_code_yields_no_files() {
+        assert!(extract_files("The design looks correct overall.", "x.rs").is_empty());
+    }
+
+    #[test]
+    fn an_unclosed_block_from_a_truncated_answer_is_still_recovered() {
+        let d = "src/fib.rs\n```rust\npub fn fib(n: u32) -> u32 {\n    n\n}";
+        let files = extract_files(d, "fallback.rs");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/fib.rs");
+    }
+
+    #[test]
+    fn a_compliant_structured_answer_is_untouched() {
+        let compliant = "FINDINGS:\n- unwrap can panic -> use ok_or\nVERDICT: FAIL";
+        assert_eq!(distill_answer(compliant), compliant);
+    }
+
+    #[test]
+    fn a_short_lead_in_before_a_header_is_not_worth_cutting() {
+        let brief = "Here it is.\n\nFINDINGS:\n- none\nVERDICT: PASS";
+        assert_eq!(distill_answer(brief), brief);
+    }
+
+    #[test]
+    fn ordinary_prose_and_code_never_trigger_the_section_cut() {
+        // Rust paths, markdown headings and inline colons must not look like
+        // section headers.
+        for text in [
+            include_str!("prompt.rs"),
+            include_str!("../tui/ui.rs"),
+            "The implementation looks fine. One note: the loop bound is off by one.",
+        ] {
+            assert_eq!(
+                distill_answer(text),
+                text,
+                "false positive on ordinary content"
+            );
+        }
     }
 
     #[test]

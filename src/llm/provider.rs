@@ -41,6 +41,40 @@ pub struct LlmStreamChunk {
 
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<LlmStreamChunk>> + Send>>;
 
+/// What a backend reports about an installed model.
+///
+/// Routing reads this rather than guessing from names alone: Ollama declares
+/// whether a model can reason and how many parameters it has, which is far more
+/// reliable than pattern-matching a tag.
+#[derive(Debug, Clone, Default)]
+pub struct ModelInfo {
+    pub name: String,
+    /// Parameter count in billions, when the backend reports it.
+    pub parameter_billions: Option<f32>,
+    /// Declared capabilities, e.g. `tools`, `thinking`, `insert`.
+    pub capabilities: Vec<String>,
+    pub context_length: Option<usize>,
+}
+
+impl ModelInfo {
+    pub fn bare(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Whether the model can produce an explicit reasoning pass.
+    pub fn can_reason(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "thinking")
+    }
+
+    /// Size as a routing signal; unknown sizes sort last.
+    pub fn size(&self) -> f32 {
+        self.parameter_billions.unwrap_or(0.0)
+    }
+}
+
 /// Per-call generation settings.
 #[derive(Debug, Clone)]
 pub struct ChatOptions {
@@ -73,12 +107,17 @@ pub trait LlmProvider: Send + Sync {
     async fn is_available(&self) -> bool;
     async fn list_models(&self) -> Result<Vec<String>>;
 
-    /// Context window the model itself advertises, when the backend exposes it.
+    /// Installed models with whatever metadata the backend exposes.
     ///
-    /// Knowing this is what stops a prompt from being silently truncated: the
-    /// caller clamps its budget to whatever is actually allocated.
-    async fn model_context_length(&self, _model: &str) -> Option<usize> {
-        None
+    /// Defaults to names only, so a backend that reports nothing extra still
+    /// works — routing simply has less to go on.
+    async fn list_model_info(&self) -> Vec<ModelInfo> {
+        self.list_models()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(ModelInfo::bare)
+            .collect()
     }
     async fn stream_chat(
         &self,

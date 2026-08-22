@@ -1,5 +1,7 @@
 use crate::core::memory::ChatMessage;
-use crate::llm::provider::{ChatOptions, ChunkStream, LlmProvider, LlmStreamChunk, ToolCall};
+use crate::llm::provider::{
+    ChatOptions, ChunkStream, LlmProvider, LlmStreamChunk, ModelInfo, ToolCall,
+};
 use crate::tools::tool::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -96,11 +98,26 @@ struct OllamaModelItem {
     name: String,
     #[serde(default)]
     details: Option<OllamaModelDetails>,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct OllamaModelDetails {
     context_length: Option<usize>,
+    /// Reported as a string such as "7.6B".
+    parameter_size: Option<String>,
+}
+
+/// Parse Ollama's "7.6B" / "3.2B" into billions.
+fn parse_parameter_size(raw: &str) -> Option<f32> {
+    let trimmed = raw.trim();
+    let (number, scale) = match trimmed.chars().last()? {
+        'B' | 'b' => (&trimmed[..trimmed.len() - 1], 1.0),
+        'M' | 'm' => (&trimmed[..trimmed.len() - 1], 0.001),
+        _ => (trimmed, 1.0),
+    };
+    number.trim().parse::<f32>().ok().map(|n| n * scale)
 }
 
 #[derive(Deserialize, Debug)]
@@ -174,18 +191,32 @@ impl LlmProvider for OllamaProvider {
         Ok(names)
     }
 
-    async fn model_context_length(&self, model: &str) -> Option<usize> {
+    async fn list_model_info(&self) -> Vec<ModelInfo> {
         let url = format!("{}/api/tags", self.endpoint);
-        let resp = self.client.get(&url).send().await.ok()?;
+        let Ok(resp) = self.client.get(&url).send().await else {
+            return Vec::new();
+        };
         if !resp.status().is_success() {
-            return None;
+            return Vec::new();
         }
-        let tags: OllamaTagsResponse = resp.json().await.ok()?;
+        let Ok(tags) = resp.json::<OllamaTagsResponse>().await else {
+            return Vec::new();
+        };
+
         tags.models
             .into_iter()
-            .find(|m| m.name == model)
-            .and_then(|m| m.details)
-            .and_then(|d| d.context_length)
+            .map(|m| {
+                let details = m.details.as_ref();
+                ModelInfo {
+                    name: m.name,
+                    parameter_billions: details
+                        .and_then(|d| d.parameter_size.as_deref())
+                        .and_then(parse_parameter_size),
+                    capabilities: m.capabilities,
+                    context_length: details.and_then(|d| d.context_length),
+                }
+            })
+            .collect()
     }
 
     async fn stream_chat(

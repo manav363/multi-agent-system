@@ -924,7 +924,8 @@ impl App {
                             Some(self.event_tx.clone()),
                         )
                         .with_blackboard(self.orchestrator.blackboard.clone())
-                        .with_context_tokens(self.context_tokens);
+                        .with_context_tokens(self.context_tokens)
+                        .with_workspace(self.workspace.clone());
 
                         self.workflow_cancel_token = Some(worker.cancel_token.clone());
 

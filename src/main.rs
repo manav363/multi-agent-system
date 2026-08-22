@@ -15,7 +15,7 @@ use core::routing::plan_routing;
 use core::session::{render_benchmark, BenchmarkRow, Session, StepRecord};
 use core::topology::TopologyMode;
 use core::{Orchestrator, DEFAULT_CONTEXT_TOKENS};
-use llm::{LlmProvider, OllamaProvider, OpenAiCompatProvider};
+use llm::{LlmProvider, ModelInfo, OllamaProvider, OpenAiCompatProvider};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -234,18 +234,18 @@ async fn load_roster(args: &CliArgs, provider: &Arc<dyn LlmProvider>) -> Result<
         // Ask the server what is installed, so a code-specialised model can be
         // picked up automatically. An unreachable server just means no
         // suggestions, not a failure — that is reported separately.
-        let installed = provider.list_models().await.unwrap_or_default();
-        let routing = match &args.model {
-            // Explicit request: honoured for every code role, no detection.
-            Some(model) => plan_routing(&[], model, args.planner_model.as_deref()),
-            None => plan_routing(&installed, FALLBACK_MODEL, args.planner_model.as_deref()),
-        };
+        // Ask the backend what it has and what each model can do, so roles go
+        // to the models that suit them rather than all to one.
+        let installed = catalogue(provider, args.requested_model()).await;
+
+        let routing = plan_routing(
+            &installed,
+            args.model.as_deref(),
+            args.planner_model.as_deref(),
+        );
 
         if routing.distinct().len() > 1 {
-            eprintln!(
-                "Model routing: code on {}, prose on {}",
-                routing.coder, routing.planner
-            );
+            eprintln!("Model routing: {}", routing.summary());
         }
 
         let mut roster = routing.into_roster();
@@ -275,12 +275,30 @@ fn build_tools(args: &CliArgs) -> ToolRegistry {
     tools
 }
 
-/// Clamp the requested window to what the model actually advertises, so we
-/// never budget against space the server will not allocate.
-async fn effective_context(args: &CliArgs, provider: &Arc<dyn LlmProvider>, model: &str) -> usize {
-    match provider.model_context_length(model).await {
-        Some(advertised) => advertised.min(args.context_length),
-        None => args.context_length,
+/// Clamp the requested window to what the models in play actually advertise, so
+/// we never budget against space the server will not allocate.
+///
+/// The smallest window among the models being used is the binding constraint —
+/// a prompt sized for the largest would be truncated by the others.
+fn effective_context(args: &CliArgs, catalogue: &[ModelInfo], roster: &[Agent]) -> usize {
+    let in_use: Vec<&str> = roster.iter().map(|a| a.config.model.as_str()).collect();
+    catalogue
+        .iter()
+        .filter(|m| in_use.contains(&m.name.as_str()))
+        .filter_map(|m| m.context_length)
+        .min()
+        .map_or(args.context_length, |advertised| {
+            advertised.min(args.context_length)
+        })
+}
+
+/// Installed models with whatever metadata the backend reports.
+async fn catalogue(provider: &Arc<dyn LlmProvider>, fallback: &str) -> Vec<ModelInfo> {
+    let found = provider.list_model_info().await;
+    if found.is_empty() {
+        vec![ModelInfo::bare(fallback)]
+    } else {
+        found
     }
 }
 
@@ -290,7 +308,8 @@ async fn run_app(
     roster: Vec<Agent>,
     args: &CliArgs,
 ) -> Result<()> {
-    let context_tokens = effective_context(args, &provider, args.requested_model()).await;
+    let catalogue = catalogue(&provider, args.requested_model()).await;
+    let context_tokens = effective_context(args, &catalogue, &roster);
     let app = tui::App::new(tui::AppConfig {
         provider,
         tools: build_tools(args),
@@ -324,7 +343,8 @@ async fn run_headless(
     }
 
     let topology: TopologyMode = args.topology.into();
-    let context_tokens = effective_context(args, &provider, args.requested_model()).await;
+    let catalogue = catalogue(&provider, args.requested_model()).await;
+    let context_tokens = effective_context(args, &catalogue, &roster);
 
     println!("⚡ AGENT ORCHESTRA (headless)");
     println!("├─ Provider:   {}", provider.name());
@@ -366,7 +386,8 @@ async fn run_benchmark(
     }
 
     let topologies = core::session::parse_topology_list(list)?;
-    let context_tokens = effective_context(args, &provider, args.requested_model()).await;
+    let catalogue = catalogue(&provider, args.requested_model()).await;
+    let context_tokens = effective_context(args, &catalogue, &roster);
 
     println!("⚡ AGENT ORCHESTRA (benchmark)");
     println!("├─ Goal:       {goal}");
@@ -430,7 +451,8 @@ async fn execute_once(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut orchestrator =
         Orchestrator::from_agents(topology, provider, roster, build_tools(args), Some(tx))
-            .with_context_tokens(context_tokens);
+            .with_context_tokens(context_tokens)
+            .with_workspace(args.workspace.clone());
 
     let goal_owned = goal.to_string();
     let task = tokio::spawn(async move {

@@ -385,6 +385,79 @@ async fn every_tool_call_in_one_turn_is_executed_not_just_the_first() {
     let _ = tokio::fs::remove_file("./scratch/multi_b.txt").await;
 }
 
+/// Producing artifacts is the point of a run, and it must not depend on a small
+/// model remembering to call a tool.
+#[tokio::test]
+async fn the_deliverable_is_saved_even_when_no_agent_calls_write_file() {
+    let deliverable =
+        "Here is the implementation:\n\n```rust\npub fn fib(n: u32) -> u32 { n }\n```\n";
+    let provider = Arc::new(MockProvider::always(deliverable));
+    let dir = std::path::PathBuf::from("./scratch/recovered");
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+
+    let mut orch = Orchestrator::from_agents(
+        TopologyMode::DirectCoder,
+        provider,
+        Agent::default_roster("mock-small"),
+        workspace_tools(),
+        None,
+    )
+    .with_workspace(dir.clone());
+
+    orch.execute_goal("Write fib. Save it as src/fib.rs")
+        .await
+        .unwrap();
+
+    let saved = tokio::fs::read_to_string(dir.join("src/fib.rs")).await;
+    assert!(saved.is_ok(), "the deliverable should have been recovered");
+    assert!(saved.unwrap().contains("pub fn fib"));
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+#[tokio::test]
+async fn recovery_does_not_run_when_an_agent_already_saved_the_files() {
+    let provider = Arc::new(MockProvider::new(vec![
+        MockTurn::text("saving").with_tool_call(
+            "write_file",
+            serde_json::json!({"path": "src/done.rs", "content": "pub fn done() {}"}),
+        ),
+        MockTurn::text("Here it is:\n```rust\npub fn other() {}\n```"),
+    ]));
+    let dir = std::path::PathBuf::from("./scratch/no-recover");
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+
+    let mut orch = Orchestrator::from_agents(
+        TopologyMode::DirectCoder,
+        provider,
+        Agent::default_roster("mock-small"),
+        {
+            let mut t = ToolRegistry::new();
+            register_builtin_tools(&mut t, &dir);
+            t
+        },
+        None,
+    )
+    .with_workspace(dir.clone());
+
+    let mut synth = Agent::synthesizer("mock-small");
+    synth.config.id = "coder".to_string();
+    orch.agents.insert("coder".to_string(), synth);
+
+    orch.execute_goal("Write it. Save as src/other.rs")
+        .await
+        .unwrap();
+
+    assert!(
+        dir.join("src/done.rs").exists(),
+        "the agent's own write happened"
+    );
+    assert!(
+        !dir.join("src/other.rs").exists(),
+        "recovery must not second-guess an agent that already saved"
+    );
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
 #[tokio::test]
 async fn hierarchical_runs_every_step_in_dependency_order() {
     let provider = Arc::new(MockProvider::always("step output"));
@@ -611,14 +684,15 @@ async fn prompts_are_trimmed_to_stay_inside_the_context_window() {
         workspace_tools(),
         None,
     )
-    .with_context_tokens(4096);
+    // Small enough that even a guard-capped research output must be shortened.
+    .with_context_tokens(2048);
 
     orch.execute_goal("summarise the findings").await.unwrap();
 
     let planner_prompt = provider.calls()[1].user_text();
     let tokens = crate::core::text::estimate_tokens(&planner_prompt);
     assert!(
-        tokens < 4096,
+        tokens < 2048,
         "prompt must fit the window, was {tokens} tokens"
     );
     assert!(
