@@ -20,7 +20,65 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// What one agent pane shows: its own output and its own health.
+///
+/// The app previously kept a single interleaved transcript, which cannot be
+/// split back apart per agent. Each agent now accumulates its own.
+#[derive(Debug, Clone, Default)]
+pub struct AgentView {
+    /// The agent's answer so far, content only — reasoning is summarised, not shown.
+    pub output: String,
+    /// Lines of reasoning seen, so a pane can say how much thinking happened.
+    pub thought_lines: usize,
+    /// Most recent tool activity, for the pane's status line.
+    pub last_tool: Option<ToolActivity>,
+    pub tool_calls: usize,
+    /// Wall-clock start of the agent's current step.
+    pub started_at: Option<Instant>,
+    /// Duration of the last completed step.
+    pub last_duration_ms: Option<u64>,
+    /// Steps this agent has completed in the run.
+    pub steps_done: usize,
+    /// Set when a step failed, so the pane can show why.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolActivity {
+    pub name: String,
+    pub running: bool,
+    pub is_error: bool,
+    pub duration_ms: u64,
+}
+
+impl AgentView {
+    /// Reset for a new run, keeping nothing from the last one.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Begin a step: the pane switches from its previous result to live output.
+    pub fn begin_step(&mut self) {
+        self.output.clear();
+        self.thought_lines = 0;
+        self.last_tool = None;
+        self.error = None;
+        self.started_at = Some(Instant::now());
+    }
+
+    pub fn finish_step(&mut self, duration_ms: u64) {
+        self.last_duration_ms = Some(duration_ms);
+        self.steps_done += 1;
+        self.started_at = None;
+    }
+
+    /// Seconds the current step has been running, for a live timer.
+    pub fn elapsed_secs(&self) -> Option<f64> {
+        self.started_at.map(|s| s.elapsed().as_secs_f64())
+    }
+}
 
 /// Transcript entries kept in memory. A long workflow streams megabytes; the
 /// scrollback has to stop somewhere or the process grows without bound.
@@ -50,10 +108,10 @@ impl ActiveTab {
 
     pub fn title(&self) -> &'static str {
         match self {
-            ActiveTab::Studio => " [1] Orchestration Studio ",
-            ActiveTab::Telemetry => " [2] Latency & Telemetry ",
-            ActiveTab::AgentsConfig => " [3] Agent Roster & Prompts ",
-            ActiveTab::Blackboard => " [4] Shared Blackboard & Logs ",
+            ActiveTab::Studio => " [1] Agents ",
+            ActiveTab::Telemetry => " [2] Telemetry ",
+            ActiveTab::AgentsConfig => " [3] Roster ",
+            ActiveTab::Blackboard => " [4] Memory & Log ",
         }
     }
 
@@ -121,6 +179,21 @@ pub struct App {
     pub transcript_viewport: Cell<ViewportInfo>,
     /// Agent ids in roster order.
     pub agent_order: Vec<String>,
+    /// Whether the model server answered at startup — the connectivity half of
+    /// each pane's health readout.
+    pub provider_online: bool,
+    /// One view per agent, keyed by agent id — what its pane renders.
+    pub agent_views: HashMap<String, AgentView>,
+    /// Which pane the keyboard is on. Indexes the grid, so the last slot is
+    /// the deliverable.
+    pub focused_pane: usize,
+    /// A focused pane expanded to the whole screen. One sixth of a terminal
+    /// cannot show a finished deliverable.
+    pub zoomed: bool,
+    /// The finished answer, shown in the deliverable pane.
+    pub deliverable: String,
+    /// Files the run saved, listed under the deliverable.
+    pub files_written: Vec<String>,
     pub context_tokens: usize,
     pub session_dir: PathBuf,
     pub save_sessions: bool,
@@ -219,6 +292,12 @@ impl App {
             input_cursor_pos: 0,
             orchestrator,
             agent_order,
+            provider_online,
+            agent_views: HashMap::new(),
+            focused_pane: 0,
+            zoomed: false,
+            deliverable: String::new(),
+            files_written: Vec::new(),
             available_models,
             selected_model_idx,
             selected_topology_idx: 0,
@@ -251,6 +330,20 @@ impl App {
             history_tx,
             history_rx,
         })
+    }
+
+    /// Panes in the grid: every agent, then the deliverable.
+    pub fn pane_count(&self) -> usize {
+        self.agent_order.len() + 1
+    }
+
+    /// The view for an agent, or a default one if it has not run yet.
+    pub fn view_for(&self, agent_id: &str) -> AgentView {
+        self.agent_views.get(agent_id).cloned().unwrap_or_default()
+    }
+
+    fn view_mut(&mut self, agent_id: &str) -> &mut AgentView {
+        self.agent_views.entry(agent_id.to_string()).or_default()
     }
 
     /// Agents in roster order, which the configured roster defines.
@@ -310,6 +403,23 @@ impl App {
         }
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn focus_for_test(&self) -> usize {
+        self.focused_pane
+    }
+
+    /// Move pane focus, wrapping at both ends.
+    ///
+    /// Wrapping matters because the panes form a grid rather than a list —
+    /// there is no natural end to stop at.
+    pub fn focus_next_pane(&mut self, delta: i32) {
+        let panes = self.pane_count() as i32;
+        if panes == 0 {
+            return;
+        }
+        self.focused_pane = (self.focused_pane as i32 + delta).rem_euclid(panes) as usize;
     }
 
     /// Pull the live blackboard into a snapshot the synchronous renderer can read.
@@ -471,6 +581,13 @@ impl App {
                     .map(|a| a.config.name.clone())
                     .unwrap_or_else(|| agent_id.clone());
 
+                self.view_mut(&agent_id).last_tool = Some(ToolActivity {
+                    name: tool_name.clone(),
+                    running: true,
+                    is_error: false,
+                    duration_ms: 0,
+                });
+
                 self.mark_last_output_finished();
                 self.push_transcript(TranscriptItem::ToolExecution {
                     agent_name,
@@ -524,9 +641,12 @@ impl App {
                 title,
                 step_index,
                 total_steps,
+                ref agent_id,
                 ..
             } => {
                 self.step_progress = Some((step_index, total_steps));
+                // The pane switches from its previous result to live output.
+                self.view_mut(agent_id).begin_step();
                 self.mark_last_output_finished();
                 self.push_transcript(TranscriptItem::Milestone {
                     step_title: title,
@@ -551,7 +671,16 @@ impl App {
                     .get(&agent_id)
                     .map(|a| a.config.name.clone())
                     .unwrap_or_default();
+                // Copy the metrics out before touching the views, so the
+                // immutable borrow of `metrics` ends first.
                 let m = self.metrics.agent_metrics.get(&agent_id);
+                let (ttft_ms, avg_tps) = (m.and_then(|x| x.ttft_ms), m.map(|x| x.avg_tps));
+
+                {
+                    let view = self.view_mut(&agent_id);
+                    view.finish_step(duration_ms);
+                    view.tool_calls += tool_calls;
+                }
 
                 self.metrics.add_waterfall_span(WaterfallSpan {
                     step_index,
@@ -560,9 +689,9 @@ impl App {
                     agent_name,
                     start_offset_ms,
                     duration_ms,
-                    ttft_ms: m.and_then(|x| x.ttft_ms),
+                    ttft_ms,
                     tokens_generated: tokens,
-                    avg_tps: m.map(|x| x.avg_tps).unwrap_or(0.0),
+                    avg_tps: avg_tps.unwrap_or(0.0),
                     tool_calls_count: tool_calls,
                 });
 
@@ -813,6 +942,7 @@ impl App {
         match self.input_mode {
             InputMode::Normal => match key.code {
                 KeyCode::Char('q') => return Ok(true),
+                KeyCode::Esc if self.zoomed => self.zoomed = false,
                 KeyCode::Esc => {
                     // Cancel running workflow
                     if self.is_running_workflow {
@@ -826,12 +956,19 @@ impl App {
                 KeyCode::Char('i') | KeyCode::Enter => {
                     self.input_mode = InputMode::EditingPrompt;
                 }
+                // On the grid, Tab walks the panes — that is the thing you
+                // navigate there. Elsewhere it keeps switching views.
+                KeyCode::Tab if self.active_tab == ActiveTab::Studio => self.focus_next_pane(1),
+                KeyCode::BackTab if self.active_tab == ActiveTab::Studio => {
+                    self.focus_next_pane(-1)
+                }
                 KeyCode::Tab => {
                     self.active_tab = self.active_tab.next();
                 }
                 KeyCode::BackTab => {
                     self.active_tab = self.active_tab.prev();
                 }
+                KeyCode::Char('z') => self.zoomed = !self.zoomed,
                 KeyCode::Char('1') => self.active_tab = ActiveTab::Studio,
                 KeyCode::Char('2') => self.active_tab = ActiveTab::Telemetry,
                 KeyCode::Char('3') => self.active_tab = ActiveTab::AgentsConfig,
@@ -867,6 +1004,8 @@ impl App {
                 }
                 KeyCode::Home | KeyCode::Char('g') => self.scroll_to_top(),
                 KeyCode::End | KeyCode::Char('G') => self.scroll_to_bottom(),
+                KeyCode::Left if self.active_tab == ActiveTab::Studio => self.focus_next_pane(-1),
+                KeyCode::Right if self.active_tab == ActiveTab::Studio => self.focus_next_pane(1),
                 KeyCode::Left => {
                     self.selected_agent_idx = self.selected_agent_idx.saturating_sub(1);
                 }
@@ -896,6 +1035,11 @@ impl App {
 
                         self.metrics.start_workflow();
                         self.pending_tool_calls.clear();
+                        for view in self.agent_views.values_mut() {
+                            view.clear();
+                        }
+                        self.deliverable.clear();
+                        self.files_written.clear();
                         self.is_running_workflow = true;
                         self.active_goal = Some(prompt.clone());
                         self.goal_started_at = Some(Utc::now());

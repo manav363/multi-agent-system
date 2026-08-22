@@ -20,7 +20,7 @@
 <tr>
 <td width="50%">
 
-**5.3 MB single binary** · **~9,500 lines of Rust** · **132 tests** · **Zero Python, Zero Node.js**
+**5.3 MB single binary** · **~10,700 lines of Rust** · **170 tests** · **Zero Python, Zero Node.js**
 
 Agent Orchestra coordinates specialized AI agents — **Researcher**, **Planner**, **Engineer**, **Critic**, and **Synthesizer** — across dependency-graph topologies to solve programming and architectural tasks using **your local models**. Independent agents run concurrently, a failing review triggers a bounded revision round, and the Synthesizer writes the result to disk. No API keys. No cloud. No telemetry.
 
@@ -28,20 +28,20 @@ Agent Orchestra coordinates specialized AI agents — **Researcher**, **Planner*
 <td width="50%">
 
 ```
-┌─ Orchestration Studio ─────────────────────────┐
-│ ⚡ AGENT ORCHESTRA  │ STEP 4/7 · 38s │ RUNNING │
-│ ┌────────┐┌────────┐┌────────┐┌────────┐┌────┐│
-│ │🔍 Res  ││📋 Plan ││⚡ Eng  ││🛡️ Crit ││✨Syn││
-│ │DONE    ││DONE    ││DONE    ││CRITIQUE││IDLE││
-│ └────────┘└────────┘└────────┘└────────┘└────┘│
-│                                                │
-│ ◆ STEP 1/7  Architectural Blueprint · 6.1s     │
-│ ◆ STEP 2/7  Context Exploration ─┐             │
-│ ◆ STEP 3/7  Core Implementation ─┘ concurrent  │
-│   TOOL  Scout → read_file   ok · 12ms          │
-│ ◆ STEP 4/7  Security & Performance Review      │
-│   ▲ Review failed — revision round 1 of 1      │
-└────────────────────────────────────────────────┘
+┌ Models (3) ─────┐┌ Goal ─────────────────────┐┌ Hierarchical ──┐
+│ qwen2.5-coder…  ││ Implement an LRU cache…   ││ STEP 3/7 · 42s │
+└─────────────────┘└───────────────────────────┘└────────────────┘
+ [1] Agents · [2] Telemetry · [3] Roster · [4] Memory & Log
+╔ Researcher ═══════╗┌ Planner ─────────┐┌ Engineer ────────┐
+║🔍 Scout      DONE ║│📋 Architect DONE ││⚡ Engineer ⠹STREAM│
+║● ok · llama3.2:3b ║│● ok · qwen3:4b   ││● ok · qwen2.5… 7b│
+║  ttft 890ms 19t/s ║│  ttft 6.0s 20t/s ││  ttft 1.2s 19t/s │
+║✓ read_file  12ms  ║│💭 14 lines       ││ pub fn get(&self)│
+╚═══════════════════╝└──────────────────┘└──────────────────┘
+┌ Critic ───────────┐┌ Synthesizer ─────┐┌ Deliverable ─────┐
+│🛡️ Critic     IDLE  ││✨ Synth      IDLE ││ ✓ src/lru.rs     │
+│○ idle · qwen2.5…  ││○ idle · qwen2.5… ││ pub struct Lru…  │
+└───────────────────┘└──────────────────┘└──────────────────┘
 ```
 
 </td>
@@ -59,7 +59,7 @@ Most multi-agent frameworks are Python-based, cloud-dependent, and hide what the
 | **Language** | Python (GIL-bound) | **Rust** (true parallelism) |
 | **Distribution** | `pip install` + virtualenv | **Single 5MB binary** |
 | **Cloud Required** | Usually (API keys) | **Never** (Ollama-native) |
-| **UI** | None / heavy web dashboard | **Real-time terminal UI** |
+| **UI** | None / heavy web dashboard | **Every agent live on one terminal screen** |
 | **Token Streaming** | Buffered / chunked | **True token-by-token** |
 | **Agent Concurrency** | Sequential by default | **Dependency graph, concurrent levels** |
 | **Context Overflow** | Silently truncated by the server | **Budgeted and reported** |
@@ -119,8 +119,11 @@ Orchestra inspects the models you have installed and assigns each role automatic
 - **Reasoning models** — `<think>` tags and Ollama's `thinking` field are parsed and kept out of the deliverable. Reasoning is **off by default**; see [Getting Good Output](#-getting-good-output).
 
 ### Interactive Terminal UI
-- **4-tab dashboard** — Orchestration Studio, Latency & Telemetry, Agent Roster, Shared Blackboard & Logs.
-- **Live transcript** — token-by-token streaming, syntax-gutter code blocks, collapsed reasoning, step badges, scrollbar and follow mode.
+- **Every agent on screen at once** — the grid sizes itself to the roster, so a five-agent roster tiles as 3×2 and a four-agent one as 2×2, each cell the same size. Narrow terminals drop a column rather than squeezing panes unreadable.
+- **Each pane carries its agent's health** — a connectivity dot judged from evidence (offline / failed / idle / ok), the model it runs on, TTFT, throughput, token count, live tool activity with timing, and a running step timer.
+- **The goal input spans the top**, with the models in play beside it and run progress on the right.
+- **Deliverable pane** — the spare grid cell holds the finished answer and the files written. Press `z` to zoom any pane full-screen; a sixth of a terminal cannot show a deliverable.
+- **Four views** — Agents · Telemetry · Roster · Memory & Log. On the grid, `Tab` walks panes; elsewhere it switches views.
 - **Editable prompts** — press `e` on the Roster tab to edit an agent's system prompt and `Ctrl+S` to save it back to your roster file.
 - **Telemetry** — TTFT, throughput sparkline, per-agent table and a real Gantt timeline showing which steps overlapped.
 
@@ -142,8 +145,8 @@ Orchestra inspects the models you have installed and assigns each role automatic
 
 ```
                     ┌──────────────────────────────────────────┐
-                    │           Terminal User (TUI)            │
-                    │        Ratatui + Crossterm, ~16 Hz       │
+                    │        Terminal UI — agent grid          │
+                    │   goal bar · one pane per agent · ~16 Hz │
                     └──────────────┬───────────────────────────┘
                                    │ Async MPSC Event Stream
                     ┌──────────────▼───────────────────────────┐
@@ -334,20 +337,21 @@ The model spent its entire budget deliberating and never wrote the answer. Enabl
 
 | Key | Context | Action |
 |---|---|---|
-| `i` / `Enter` | Normal | Focus prompt input |
-| `Enter` | Input | Submit goal and start the workflow |
+| `i` / `Enter` | Normal | Focus the goal input |
+| `Enter` | Input | Submit the goal and start the workflow |
 | `Esc` | Normal (running) | **Cancel** the running workflow |
-| `Tab` / `1`–`4` | Normal | Studio · Telemetry · Roster · Blackboard |
+| `1`–`4` | Normal | Agents · Telemetry · Roster · Memory & Log |
+| `Tab` / `←` `→` | **Agents** | Move between agent panes |
+| `z` | Agents | **Zoom** the focused pane full-screen (`Esc` closes) |
+| `Tab` | Other views | Switch view |
 | `t` | Normal | Topology selector |
 | `m` | Normal / Roster | Model selector (global, or per-agent on the Roster tab) |
 | `e` | Roster | **Edit** the selected agent's system prompt |
 | `Ctrl+S` | Prompt editor | Save the edited prompt to the roster file |
 | `s` | Normal | Export the current run as Markdown |
-| `j` / `k` / `↑↓` / wheel | Normal | Scroll the transcript |
-| `PgUp` / `PgDn` | Normal | Scroll by a page |
-| `g` / `G` | Normal | Jump to top / bottom (`G` re-enables follow mode) |
-| `←` / `→` | Normal | Select an agent card |
-| `c` | Normal | Clear the transcript |
+| `j` / `k` / `↑↓` / wheel | Memory & Log | Scroll the run log |
+| `PgUp` / `PgDn` · `g` / `G` | Memory & Log | Page · jump to top/bottom (`G` re-arms follow) |
+| `c` | Normal | Clear the run log |
 | `Ctrl+W` / `Ctrl+U` | Input | Delete previous word / to start of line |
 | `?` / `h` | Normal | Help overlay |
 | `q` / `Ctrl+C` | Any | Exit |
@@ -402,10 +406,10 @@ Other:
 
 ## 🧪 Testing
 
-132 tests, none of which need a model server — a scripted `MockProvider` replays turns, tool calls, usage, failures and delays, so topology order, retries, the tool gate, the context budget and the revision loop are all covered offline.
+170 tests, none of which need a model server — a scripted `MockProvider` replays turns, tool calls, usage, failures and delays, so topology order, retries, the tool gate, the context budget and the revision loop are all covered offline.
 
 ```bash
-cargo test                 # all 132
+cargo test                 # all 170
 cargo test -- --nocapture  # with output
 cargo clippy --all-targets # lint
 cargo fmt --check          # formatting
@@ -439,12 +443,13 @@ src/
 │   ├── builtins.rs            # Bash (guarded), Read, Write (workspace), Web, Calculator
 │   └── coordination.rs        # blackboard_read/write, consult_agent
 ├── tui/
-│   ├── app.rs                 # App state, event loop, session saving, prompt editor
-│   ├── ui.rs                  # Layout, modals, telemetry, blackboard
+│   ├── app.rs                 # App state, per-agent views, event loop, prompt editor
+│   ├── layout.rs              # Agent-grid geometry — shape derived from the roster
+│   ├── ui.rs                  # Command bar, agent grid, deliverable, modals
 │   └── widgets/
-│       ├── agent_card.rs      # Agent pipeline cards
+│       ├── agent_pane.rs      # One agent: identity, health, live output
 │       ├── metrics_panel.rs   # Sparkline, per-agent table, Gantt waterfall
-│       └── transcript.rs      # Streaming transcript, scroll, code rendering
+│       └── transcript.rs      # Chronological run log, scroll, code rendering
 ├── metrics/
 │   └── tracker.rs             # TTFT, TPS, token reconciliation, waterfall spans
 └── tests.rs                   # End-to-end orchestration tests against MockProvider

@@ -926,6 +926,134 @@ async fn each_agent_is_asked_at_its_own_temperature() {
 
 /// A dead endpoint should be reported once at startup, not discovered again on
 /// every step.
+/// The grid is navigated by pane, and the panes wrap because they form a grid
+/// with no natural end.
+/// Render the whole UI into an off-screen buffer and return it as text, so the
+/// layout can be asserted on without a terminal.
+#[cfg(test)]
+async fn render_to_text(width: u16, height: u16) -> String {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let app = crate::tui::App::new(crate::tui::AppConfig {
+        provider: Arc::new(MockProvider::always("ok")),
+        tools: workspace_tools(),
+        roster: Agent::default_roster("mock-small"),
+        default_model: "mock-small".to_string(),
+        context_tokens: 8192,
+        session_dir: std::path::PathBuf::from("./scratch/sessions"),
+        save_sessions: false,
+        workspace: std::path::PathBuf::from("./scratch"),
+        roster_path: std::path::PathBuf::from("./scratch/roster.json"),
+    })
+    .await
+    .unwrap();
+
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|f| crate::tui::ui::render_app_ui(f, &app))
+        .unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+#[ignore = "visual inspection: cargo test print_layout -- --ignored --nocapture"]
+async fn print_layout() {
+    println!("\n{}", render_to_text(150, 40).await);
+}
+
+/// Every agent must be on screen at once, each in its own pane.
+#[tokio::test]
+async fn the_grid_shows_every_agent_and_the_deliverable() {
+    let screen = render_to_text(180, 48).await;
+
+    for role in ["Researcher", "Planner", "Engineer", "Critic", "Synthesizer"] {
+        assert!(screen.contains(role), "{role} is missing from the grid");
+    }
+    assert!(
+        screen.contains("Deliverable"),
+        "the deliverable pane is missing"
+    );
+    assert!(screen.contains("Goal"), "the query input is missing");
+    assert!(screen.contains("Models"), "the model listing is missing");
+}
+
+/// The query bar spans the top, above the grid.
+#[tokio::test]
+async fn the_query_input_sits_at_the_top_above_every_agent() {
+    let screen = render_to_text(180, 48).await;
+    let lines: Vec<&str> = screen.lines().collect();
+
+    let goal_row = lines.iter().position(|l| l.contains("Goal")).unwrap();
+    let first_agent_row = lines
+        .iter()
+        .position(|l| l.contains("Researcher") || l.contains("Research Scout"))
+        .unwrap();
+
+    assert!(
+        goal_row < first_agent_row,
+        "the goal input (row {goal_row}) must be above the agents (row {first_agent_row})"
+    );
+    assert!(goal_row <= 3, "the query bar belongs at the very top");
+}
+
+/// A narrow terminal must still render every pane rather than clipping some.
+#[tokio::test]
+async fn every_agent_survives_a_narrow_terminal() {
+    let screen = render_to_text(90, 44).await;
+    for role in ["Researcher", "Planner", "Engineer", "Critic", "Synthesizer"] {
+        assert!(screen.contains(role), "{role} was dropped at 90 columns");
+    }
+}
+
+#[tokio::test]
+async fn pane_focus_wraps_in_both_directions() {
+    let mut app = crate::tui::App::new(crate::tui::AppConfig {
+        provider: Arc::new(MockProvider::always("ok")),
+        tools: workspace_tools(),
+        roster: Agent::default_roster("mock-small"),
+        default_model: "mock-small".to_string(),
+        context_tokens: 8192,
+        session_dir: std::path::PathBuf::from("./scratch/sessions"),
+        save_sessions: false,
+        workspace: std::path::PathBuf::from("./scratch"),
+        roster_path: std::path::PathBuf::from("./scratch/roster.json"),
+    })
+    .await
+    .unwrap();
+
+    // Five agents plus the deliverable.
+    assert_eq!(app.pane_count(), 6);
+
+    app.focus_next_pane(-1);
+    assert_eq!(
+        app.focus_for_test(),
+        5,
+        "stepping back from the first wraps to the last"
+    );
+
+    app.focus_next_pane(1);
+    assert_eq!(
+        app.focus_for_test(),
+        0,
+        "and forward from the last wraps to the first"
+    );
+
+    for _ in 0..3 {
+        app.focus_next_pane(1);
+    }
+    assert_eq!(app.focus_for_test(), 3);
+}
+
 #[tokio::test]
 async fn an_unreachable_provider_is_surfaced_before_any_goal_runs() {
     let app = crate::tui::App::new(crate::tui::AppConfig {

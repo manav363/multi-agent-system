@@ -13,21 +13,6 @@ pub enum AgentStatus {
     Error,
 }
 
-impl AgentStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AgentStatus::Idle => "IDLE",
-            AgentStatus::Planning => "PLANNING",
-            AgentStatus::Thinking => "THINKING",
-            AgentStatus::Streaming => "STREAMING",
-            AgentStatus::CallingTool => "TOOL_EXEC",
-            AgentStatus::Evaluating => "CRITIQUING",
-            AgentStatus::Done => "DONE",
-            AgentStatus::Error => "ERROR",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OrchestratorEvent {
     AgentStatusChanged {
