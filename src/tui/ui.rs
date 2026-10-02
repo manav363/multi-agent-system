@@ -6,7 +6,7 @@ use crate::tui::widgets::{
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -16,27 +16,24 @@ pub fn render_app_ui(f: &mut Frame, app: &App) {
     let root_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Command bar: models · query · status
-            Constraint::Length(1), // Tab strip
+            Constraint::Length(1), // Header: brand · tabs · run status
             Constraint::Min(8),    // Workspace
+            Constraint::Length(1), // Footer: goal input · key hints
         ])
         .split(size);
 
-    // 1. Command bar — the query input, full width, with the models beside it.
-    render_command_bar(f, root_chunks[0], app);
-    render_tab_strip(f, root_chunks[1], app);
+    render_header(f, root_chunks[0], app);
+    render_footer(f, root_chunks[2], app);
 
-    // 2. Render Active Tab Content
     match app.active_tab {
-        ActiveTab::Studio => render_agent_grid(f, root_chunks[2], app),
+        ActiveTab::Studio => render_agent_grid(f, root_chunks[1], app),
         ActiveTab::Telemetry => {
-            render_metrics_dashboard(f, root_chunks[2], &app.metrics, &app.ordered_agents())
+            render_metrics_dashboard(f, root_chunks[1], &app.metrics, &app.ordered_agents())
         }
-        ActiveTab::AgentsConfig => render_agents_config_tab(f, root_chunks[2], app),
-        ActiveTab::Blackboard => render_blackboard_and_logs_tab(f, root_chunks[2], app),
+        ActiveTab::AgentsConfig => render_agents_config_tab(f, root_chunks[1], app),
+        ActiveTab::Blackboard => render_blackboard_and_logs_tab(f, root_chunks[1], app),
     }
 
-    // 4. Render Modals if active
     match app.input_mode {
         InputMode::ModelSelectModal => render_model_modal(f, size, app),
         InputMode::TopologySelectModal => render_topology_modal(f, size, app),
@@ -46,154 +43,30 @@ pub fn render_app_ui(f: &mut Frame, app: &App) {
     }
 }
 
-/// The command bar: model listing, the query input at full width, and run status.
+/// One-line header: brand, the four views, and the run's live status.
 ///
-/// The input moved from the bottom of the screen to the top, because it is the
-/// one control the whole interface exists to serve.
-fn render_command_bar(f: &mut Frame, area: Rect, app: &App) {
+/// The old chrome spent four rows on three bordered boxes around the goal
+/// input. The input now lives in the footer and every row between header and
+/// footer belongs to the agents.
+fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(30), // models
-            Constraint::Min(30),    // query
-            Constraint::Length(30), // status
+            Constraint::Length(14), // brand
+            Constraint::Min(44),    // tabs
+            Constraint::Length(40), // status
         ])
         .split(area);
 
-    render_model_summary(f, chunks[0], app);
-    render_query_input(f, chunks[1], app);
-    render_run_status(f, chunks[2], app);
-}
-
-/// Which models are in play, collapsed to fit beside the input.
-fn render_model_summary(f: &mut Frame, area: Rect, app: &App) {
-    let mut distinct: Vec<&str> = app
-        .ordered_agents()
-        .iter()
-        .map(|a| a.config.model.as_str())
-        .collect();
-    distinct.sort_unstable();
-    distinct.dedup();
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(58, 62, 76)))
-        .title(Span::styled(
-            format!(" Models ({}) ", distinct.len()),
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ⚡ orchestra ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        ));
-
-    let text = match distinct.len() {
-        0 => "none".to_string(),
-        1 => distinct[0].to_string(),
-        _ => distinct.join(" · "),
-    };
-
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().fg(Color::Rgb(170, 180, 205)),
-        )))
-        .block(block),
-        area,
+        ))),
+        chunks[0],
     );
-}
-
-/// The goal input, full width between the model list and the status.
-fn render_query_input(f: &mut Frame, area: Rect, app: &App) {
-    let editing = app.input_mode == InputMode::EditingPrompt;
-    let border = if editing {
-        Color::Yellow
-    } else {
-        Color::Rgb(58, 62, 76)
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .title(Span::styled(
-            " Goal ",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ));
-
-    // Cursor position is measured in display columns: a CJK glyph is two wide,
-    // so counting characters drifts the caret off the text it marks.
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let prefix: String = app
-        .prompt_input
-        .chars()
-        .take(app.input_cursor_pos)
-        .collect();
-    let cursor_col = UnicodeWidthStr::width(prefix.as_str());
-    let h_scroll = cursor_col.saturating_sub(inner_width.saturating_sub(1));
-
-    let content = if app.prompt_input.is_empty() && !editing {
-        Span::styled(
-            "Press [i] or [Enter] to type a goal…",
-            Style::default().fg(Color::DarkGray),
-        )
-    } else {
-        Span::styled(&app.prompt_input, Style::default().fg(Color::White))
-    };
-
-    f.render_widget(
-        Paragraph::new(content)
-            .block(block)
-            .scroll((0, h_scroll as u16)),
-        area,
-    );
-
-    if editing {
-        f.set_cursor_position((area.x + 1 + (cursor_col - h_scroll) as u16, area.y + 1));
-    }
-}
-
-/// Topology, progress and elapsed time.
-fn render_run_status(f: &mut Frame, area: Rect, app: &App) {
-    let (label, colour) = if app.is_running_workflow {
-        let elapsed = app.metrics.global_elapsed_ms() as f64 / 1000.0;
-        match app.step_progress {
-            Some((current, total)) => (
-                format!("STEP {current}/{total} · {elapsed:.0}s"),
-                Color::LightGreen,
-            ),
-            None => (format!("RUNNING · {elapsed:.0}s"), Color::LightGreen),
-        }
-    } else {
-        ("READY".to_string(), Color::Cyan)
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(58, 62, 76)))
-        .title(Span::styled(
-            format!(" {} ", app.orchestrator.topology.name()),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            label,
-            Style::default().fg(colour).add_modifier(Modifier::BOLD),
-        )))
-        .block(block)
-        .alignment(Alignment::Center),
-        area,
-    );
-}
-
-/// One-line tab strip with the contextual key hints.
-fn render_tab_strip(f: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(30), Constraint::Length(52)])
-        .split(area);
 
     let tabs: Vec<Line> = ActiveTab::all()
         .iter()
@@ -208,21 +81,122 @@ fn render_tab_strip(f: &mut Frame, area: Rect, app: &App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )
-            .divider("·"),
-        chunks[0],
+            .divider(" │ "),
+        chunks[1],
     );
 
-    let hint = if app.is_running_workflow {
-        "[Esc] cancel  [Tab] pane  [z] zoom"
-    } else if app.zoomed {
-        "[z]/[Esc] close  [Tab] pane"
+    // Status, right-aligned: run state first, topology and models after.
+    let mut status = Vec::new();
+    if app.is_running_workflow {
+        let elapsed = app.metrics.global_elapsed_ms() as f64 / 1000.0;
+        let progress = match app.step_progress {
+            Some((current, total)) => format!("STEP {current}/{total} · {elapsed:.0}s"),
+            None => format!("RUNNING · {elapsed:.0}s"),
+        };
+        status.push(Span::styled(
+            format!("● {progress}"),
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if app.provider_online {
+        status.push(Span::styled(
+            "● ready",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     } else {
-        "[Tab] pane  [z] zoom  [t] topo  [m] model  [?] help"
-    };
+        status.push(Span::styled(
+            "● offline",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    status.push(Span::styled("  ", Style::default()));
+    status.push(Span::styled(
+        app.orchestrator.topology.name(),
+        Style::default().fg(Color::Magenta),
+    ));
+    let mut models: Vec<&str> = app
+        .ordered_agents()
+        .iter()
+        .map(|a| a.config.model.as_str())
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    status.push(Span::styled(
+        format!(
+            " · {} model{}",
+            models.len(),
+            if models.len() == 1 { "" } else { "s" }
+        ),
+        Style::default().fg(Color::Rgb(120, 122, 138)),
+    ));
 
     f.render_widget(
+        Paragraph::new(Line::from(status)).alignment(Alignment::Right),
+        chunks[2],
+    );
+}
+
+/// One-line footer: the goal input with an inline prompt, or key hints.
+fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    let editing = app.input_mode == InputMode::EditingPrompt;
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(30), Constraint::Length(52)])
+        .split(area);
+
+    // Cursor position is measured in display columns: a CJK glyph is two
+    // wide, so counting characters drifts the caret off the text it marks.
+    let inner_width = chunks[0].width.saturating_sub(2) as usize;
+    let prefix: String = app
+        .prompt_input
+        .chars()
+        .take(app.input_cursor_pos)
+        .collect();
+    let cursor_col = UnicodeWidthStr::width(prefix.as_str());
+    let h_scroll = cursor_col.saturating_sub(inner_width.saturating_sub(1));
+
+    let prompt_span = if app.prompt_input.is_empty() && !editing {
+        Span::styled(
+            " ❯ press i to type a goal… ",
+            Style::default().fg(Color::Rgb(120, 122, 138)),
+        )
+    } else {
+        Span::styled(
+            format!(" ❯ {}", app.prompt_input),
+            Style::default().fg(Color::White).add_modifier(if editing {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+        )
+    };
+    let input_style = if editing {
+        Style::default().bg(Color::Rgb(46, 50, 66))
+    } else {
+        Style::default()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(prompt_span))
+            .style(input_style)
+            .scroll((0, h_scroll as u16)),
+        chunks[0],
+    );
+    if editing {
+        f.set_cursor_position((chunks[0].x + 2 + (cursor_col - h_scroll) as u16, area.y));
+    }
+
+    let hint = if app.is_running_workflow {
+        "[Esc] cancel · [Tab] pane · [z] zoom"
+    } else {
+        "[i] goal · [t] topology · [m] model · [s] export · [?] help"
+    };
+    f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            hint,
+            format!(" {hint} "),
             Style::default().fg(Color::Rgb(120, 122, 138)),
         )))
         .alignment(Alignment::Right),
@@ -284,7 +258,7 @@ fn render_pane(
 
 /// The finished answer, and the files the run saved.
 fn render_deliverable_pane(f: &mut Frame, area: Rect, app: &App, focused: bool) {
-    let done = !app.deliverable.is_empty();
+    let done = !app.deliverable.is_empty() || !app.files_written.is_empty();
     let accent = if done {
         Color::LightGreen
     } else {
@@ -292,15 +266,11 @@ fn render_deliverable_pane(f: &mut Frame, area: Rect, app: &App, focused: bool) 
     };
 
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(if focused {
-            ratatui::widgets::BorderType::Double
-        } else {
-            ratatui::widgets::BorderType::Plain
-        })
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if focused { Color::White } else { accent }))
         .title(Span::styled(
-            " Deliverable ",
+            " ✨ Deliverable ",
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ));
 
@@ -310,11 +280,12 @@ fn render_deliverable_pane(f: &mut Frame, area: Rect, app: &App, focused: bool) 
         return;
     }
 
+    let dim = Color::Rgb(120, 122, 138);
     let mut lines: Vec<Line> = Vec::new();
     if app.files_written.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("  workspace: {}", app.workspace.display()),
-            Style::default().fg(Color::Rgb(120, 122, 138)),
+            Style::default().fg(dim),
         )));
     } else {
         for path in &app.files_written {
@@ -326,19 +297,41 @@ fn render_deliverable_pane(f: &mut Frame, area: Rect, app: &App, focused: bool) 
     }
     lines.push(Line::from(""));
 
-    if done {
+    if !app.deliverable.is_empty() {
+        // Render the answer with code blocks picked out, matching the
+        // transcript's rendering — this pane is where the result gets read.
+        let mut in_code = false;
         for line in app.deliverable.lines() {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::Rgb(214, 216, 226)),
-            )));
+            if line.trim_start().starts_with("```") {
+                in_code = !in_code;
+                let lang = line.trim().trim_start_matches('`');
+                lines.push(Line::from(Span::styled(
+                    if in_code {
+                        format!("  ┌─ {}", if lang.is_empty() { "code" } else { lang })
+                    } else {
+                        "  └────────".to_string()
+                    },
+                    Style::default().fg(Color::Rgb(140, 120, 60)),
+                )));
+            } else if in_code {
+                lines.push(Line::from(vec![
+                    Span::styled("  │ ", Style::default().fg(Color::Rgb(140, 120, 60))),
+                    Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::Rgb(226, 214, 168)),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Rgb(214, 216, 226)),
+                )));
+            }
         }
     } else {
         lines.push(Line::from(Span::styled(
             "  the finished answer appears here",
-            Style::default()
-                .fg(Color::Rgb(120, 122, 138))
-                .add_modifier(Modifier::ITALIC),
+            Style::default().fg(dim).add_modifier(Modifier::ITALIC),
         )));
     }
 
@@ -392,6 +385,7 @@ fn render_agents_config_tab(f: &mut Frame, area: Rect, app: &App) {
 
     let list_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
         .title(Span::styled(
             " Agent Roster ",
@@ -404,10 +398,29 @@ fn render_agents_config_tab(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(list, chunks[0]);
 
     // Right: Selected Agent Detail & Prompt
-    let sel_agent = agents.get(app.selected_agent_idx).unwrap_or(&agents[0]);
+    let Some(sel_agent) = agents
+        .get(app.selected_agent_idx)
+        .or_else(|| agents.first())
+    else {
+        // An empty roster has nothing to configure; say so rather than
+        // indexing into a list that cannot have a first element.
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
+            .title(" Configuration ");
+        f.render_widget(
+            Paragraph::new("No agents loaded. Pass --roster with a valid file.")
+                .block(block)
+                .style(Style::default().fg(Color::DarkGray)),
+            chunks[1],
+        );
+        return;
+    };
 
     let right_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
         .title(Span::styled(
             format!(" Configuration: {} ", sel_agent.config.name),
@@ -488,6 +501,7 @@ fn render_blackboard_and_logs_tab(f: &mut Frame, area: Rect, app: &App) {
     // Left: Blackboard artifacts (live data)
     let blackboard_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
         .title(Span::styled(
             " Shared Memory & Blackboard (Live) ",
@@ -620,6 +634,7 @@ fn render_model_modal(f: &mut Frame, area: Rect, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
             " Select Active Open-Source Model (↑/↓ Enter) ",
@@ -664,6 +679,7 @@ fn render_topology_modal(f: &mut Frame, area: Rect, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Magenta))
         .title(Span::styled(
             " Select Swarm Topology (↑/↓ Enter) ",
@@ -688,6 +704,7 @@ fn render_prompt_editor(f: &mut Frame, area: Rect, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Yellow))
         .title(Span::styled(
             format!(" Editing system prompt · {name} "),
@@ -776,7 +793,7 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         )]),
         Line::from(""),
         section("Running a goal"),
-        row("i / Enter", "Focus the prompt input"),
+        row("i / Enter", "Focus the goal input in the footer"),
         row("Enter", "Submit the goal and start the pipeline"),
         row(
             "Esc",
@@ -784,10 +801,7 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         ),
         Line::from(""),
         section("Navigation"),
-        row(
-            "Tab / 1-4",
-            "Studio · Telemetry · Agent Roster · Blackboard",
-        ),
+        row("Tab / 1-4", "Agents · Telemetry · Roster · Log"),
         row("j / k / ↑ ↓", "Scroll the transcript"),
         row("PgUp / PgDn", "Scroll by a full page"),
         row("g / G", "Jump to top / bottom (G re-enables follow mode)"),
@@ -818,6 +832,7 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::LightGreen))
         .title(Span::styled(
             " Help ",

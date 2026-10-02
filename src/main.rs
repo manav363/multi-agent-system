@@ -449,6 +449,7 @@ async fn execute_once(
         .collect();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut printer = HeadlessPrinter::default();
     let mut orchestrator =
         Orchestrator::from_agents(topology, provider, roster, build_tools(args), Some(tx))
             .with_context_tokens(context_tokens)
@@ -468,7 +469,7 @@ async fn execute_once(
 
     while let Some(event) = rx.recv().await {
         if verbose {
-            print_event(&event);
+            printer.print(&event);
         } else if let core::events::OrchestratorEvent::SystemLog {
             level,
             target,
@@ -506,53 +507,108 @@ async fn execute_once(
     })
 }
 
-fn print_event(event: &core::events::OrchestratorEvent) {
-    use core::events::OrchestratorEvent as E;
-    use std::io::Write;
+/// Headless progress output.
+///
+/// Streaming every token of every agent was unreadable the moment a topology
+/// ran two agents at once: their deltas interleaved into gibberish on one
+/// stdout. Tokens stream only while a single agent is generating; when
+/// several run concurrently, each step reports a one-line result instead.
+#[derive(Default)]
+struct HeadlessPrinter {
+    /// Agents whose streams are open, with how many of them we printed raw.
+    active: Vec<String>,
+}
 
-    match event {
-        E::WorkflowStepStarted {
-            step_index,
-            total_steps,
-            title,
-            agent_id,
-            ..
-        } => {
-            println!("\n▶ [Step {step_index}/{total_steps}] {title} (agent: {agent_id})");
-        }
-        E::AgentTokenChunk {
-            delta, is_thought, ..
-        } => {
-            if *is_thought {
-                print!("\x1b[90m{delta}\x1b[0m");
-            } else {
-                print!("{delta}");
+impl HeadlessPrinter {
+    fn print(&mut self, event: &core::events::OrchestratorEvent) {
+        use core::events::OrchestratorEvent as E;
+        use std::io::Write;
+
+        match event {
+            E::WorkflowStepStarted {
+                step_index,
+                total_steps,
+                title,
+                agent_id,
+                ..
+            } => {
+                // A retried step announces itself again; it is still one
+                // stream, and counting it twice would suppress streaming for
+                // the rest of the run.
+                if !self.active.iter().any(|a| a == agent_id) {
+                    self.active.push(agent_id.clone());
+                }
+                println!("\n▶ [Step {step_index}/{total_steps}] {title} (agent: {agent_id})");
+                if self.active.len() > 1 {
+                    println!(
+                        "  … {} agents generating in parallel; streaming suppressed, results below",
+                        self.active.len()
+                    );
+                }
             }
-            let _ = std::io::stdout().flush();
+            E::AgentTokenChunk {
+                agent_id,
+                delta,
+                is_thought,
+                ..
+            } => {
+                if self.active.len() > 1 {
+                    return;
+                }
+                // Single stream: echo it live. Re-check in case the step
+                // roster changed mid-flight.
+                if !self.active.iter().any(|a| a == agent_id) {
+                    self.active.push(agent_id.clone());
+                }
+                if *is_thought {
+                    print!("\x1b[90m{delta}\x1b[0m");
+                } else {
+                    print!("{delta}");
+                }
+                let _ = std::io::stdout().flush();
+            }
+            E::ToolCallStarted {
+                tool_name, args, ..
+            } => {
+                println!("\n  🛠️  {tool_name} {args}");
+            }
+            E::ToolCallFinished {
+                tool_name,
+                duration_ms,
+                is_error,
+                ..
+            } => {
+                let mark = if *is_error { "✗" } else { "✓" };
+                println!("  {mark} {tool_name} ({duration_ms}ms)");
+            }
+            E::WorkflowStepFinished {
+                agent_id,
+                duration_ms,
+                tokens,
+                success,
+                output_preview,
+                ..
+            } => {
+                self.active.retain(|a| a != agent_id);
+                let mark = if *success { "✓" } else { "✗" };
+                println!(
+                    "\n  {mark} finished in {:.1}s · {tokens} tokens",
+                    *duration_ms as f64 / 1000.0
+                );
+                if !success || self.active.is_empty() {
+                    println!("  {output_preview}");
+                }
+            }
+            E::SystemLog {
+                level,
+                target,
+                message,
+                ..
+            } if level != "INFO" => {
+                println!("\n  [{level}] {target}: {message}");
+            }
+            _ => {}
         }
-        E::ToolCallStarted {
-            tool_name, args, ..
-        } => {
-            println!("\n  🛠️  {tool_name} {args}");
-        }
-        E::ToolCallFinished {
-            tool_name,
-            duration_ms,
-            is_error,
-            ..
-        } => {
-            let mark = if *is_error { "✗" } else { "✓" };
-            println!("  {mark} {tool_name} ({duration_ms}ms)");
-        }
-        E::SystemLog {
-            level,
-            target,
-            message,
-            ..
-        } if level != "INFO" => {
-            println!("\n  [{level}] {target}: {message}");
-        }
-        _ => {}
     }
 }
 

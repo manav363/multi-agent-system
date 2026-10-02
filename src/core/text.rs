@@ -28,10 +28,10 @@ pub fn byte_offset(s: &str, char_pos: usize) -> usize {
 
 /// Rough token count for budgeting.
 ///
-/// ponytail: chars/4 is the standard English approximation and is wrong for
-/// code and CJK. It only has to be close enough to keep prompts inside the
-/// window with the safety margin the caller reserves; swap in a real tokenizer
-/// if the margin ever proves too tight.
+/// chars/4 is the standard English approximation and is wrong for code and
+/// CJK. It only has to be close enough to keep prompts inside the window with
+/// the safety margin the caller reserves; swap in a real tokenizer if the
+/// margin ever proves too tight.
 pub fn estimate_tokens(s: &str) -> usize {
     s.chars().count().div_ceil(4)
 }
@@ -317,8 +317,8 @@ impl RepetitionGuard {
     /// generous multiple of it so a provider that ignores `num_predict` still
     /// cannot stream without end.
     pub fn new(max_tokens: Option<usize>) -> Self {
-        // ponytail: 8 chars/token is a deliberately loose upper bound (real
-        // ratio is ~4). It only has to stop runaways, not trim good output.
+        // 8 chars/token is a deliberately loose upper bound (real ratio is
+        // ~4). It only has to stop runaways, not trim good output.
         let max_chars = max_tokens.unwrap_or(4096).saturating_mul(8);
         Self {
             tail: String::new(),
