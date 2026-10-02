@@ -72,10 +72,12 @@ fn format_ms(ms: Option<u64>) -> String {
     }
 }
 
-/// Header: role icon, name, and live state.
+/// Header: the live step timer, with a spinner while work is in flight.
+///
+/// Identity and status live in the pane's title bars, so the first body row
+/// only has to say how long the current step has been running.
 fn header_line(ctx: &PaneContext<'_>) -> Line<'static> {
-    let role = &ctx.agent.config.role;
-    let (label, colour) = status_style(ctx.agent.status);
+    let (_, colour) = status_style(ctx.agent.status);
     let busy = matches!(
         ctx.agent.status,
         AgentStatus::Planning
@@ -85,39 +87,21 @@ fn header_line(ctx: &PaneContext<'_>) -> Line<'static> {
             | AgentStatus::Evaluating
     );
 
-    let mut spans = vec![
-        Span::styled(
-            format!("{} ", role.icon()),
-            Style::default().fg(role.default_color()),
-        ),
-        Span::styled(
-            ctx.agent.config.name.clone(),
-            Style::default()
-                .fg(role.default_color())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ", Style::default()),
-    ];
-
+    let mut spans = Vec::new();
     if busy {
         spans.push(Span::styled(
             format!("{} ", SPINNER[ctx.spinner_idx % SPINNER.len()]),
             Style::default().fg(colour),
         ));
     }
-    spans.push(Span::styled(
-        label,
-        Style::default().fg(colour).add_modifier(Modifier::BOLD),
-    ));
-
     if let Some(secs) = ctx.view.elapsed_secs() {
         spans.push(Span::styled(
-            format!(" {secs:.0}s"),
+            format!("{secs:.0}s"),
             Style::default().fg(DIM),
         ));
     } else if let Some(ms) = ctx.view.last_duration_ms {
         spans.push(Span::styled(
-            format!(" {}", format_ms(Some(ms))),
+            format!("done in {}", format_ms(Some(ms))),
             Style::default().fg(DIM),
         ));
     }
@@ -252,20 +236,28 @@ pub fn render_agent_pane(f: &mut Frame, area: Rect, ctx: &PaneContext<'_>) {
         RULE
     };
 
+    let (label, label_colour) = status_style(ctx.agent.status);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(if ctx.focused {
-            BorderType::Double
-        } else {
-            BorderType::Plain
-        })
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_colour))
         .title(Span::styled(
-            format!(" {} ", ctx.agent.config.role.name()),
+            format!(
+                " {} {} ",
+                ctx.agent.config.role.icon(),
+                ctx.agent.config.name
+            ),
             Style::default()
                 .fg(role_colour)
                 .add_modifier(Modifier::BOLD),
-        ));
+        ))
+        .title_top(
+            Line::from(Span::styled(
+                format!(" {} ", label),
+                Style::default().fg(label_colour),
+            ))
+            .alignment(ratatui::layout::Alignment::Right),
+        );
 
     let inner = block.inner(area);
     f.render_widget(block, area);

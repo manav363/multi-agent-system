@@ -13,12 +13,28 @@ use tokio::time::timeout;
 
 /// Shell command execution behind a deny-list guard.
 ///
-/// ponytail: this is a deny-list, NOT a sandbox. It stops an agent from
-/// wandering into an obviously destructive command; it does not contain a
-/// determined one (a script file, base64, or an interpreter one-liner all walk
-/// straight past it). Run the binary under a container, a dedicated user, or
-/// seccomp if you need a real boundary.
-pub struct BashCommandTool;
+/// This is a deny-list, NOT a sandbox. It stops an agent from wandering into
+/// an obviously destructive command; it does not contain a determined one (a
+/// script file, base64, or an interpreter one-liner all walk straight past
+/// it). Run the binary under a container, a dedicated user, or seccomp if you
+/// need a real boundary.
+///
+/// `default_cwd` anchors the agent to the run's workspace. Without it a scout
+/// told to "investigate the project" runs `ls` in whatever directory the
+/// binary was launched from — which is the orchestra's own repository, not
+/// the deliverable workspace.
+#[derive(Default)]
+pub struct BashCommandTool {
+    default_cwd: Option<PathBuf>,
+}
+
+impl BashCommandTool {
+    pub fn new(default_cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            default_cwd: Some(default_cwd.into()),
+        }
+    }
+}
 
 /// Max output characters kept from a command, to bound memory.
 const MAX_OUTPUT_CHARS: usize = 64_000;
@@ -256,12 +272,17 @@ impl Tool for BashCommandTool {
             );
         }
 
-        let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
+        let cwd = args
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| self.default_cwd.as_ref().map(|p| p.display().to_string()))
+            .unwrap_or_else(|| ".".to_string());
 
         // Resolve the working directory before use. A path that cannot be
         // canonicalised is rejected rather than waved through — the old code
         // skipped the whole check on failure, so a non-existent `cwd` bypassed it.
-        let canonical = Path::new(cwd)
+        let canonical = Path::new(&cwd)
             .canonicalize()
             .with_context(|| format!("Working directory '{}' does not exist", cwd))?;
         if !canonical.is_dir() {
@@ -321,7 +342,36 @@ impl Tool for BashCommandTool {
 }
 
 /// Read File Tool
-pub struct ReadFileTool;
+///
+/// When a workspace root is set, relative paths resolve against it — the read
+/// counterpart of `WriteFileTool`'s confinement. Measured on a live run, a
+/// scout asked to inspect "the project" read the orchestra binary's own
+/// `src/main.rs` instead, because `.` meant the process working directory.
+#[derive(Default)]
+pub struct ReadFileTool {
+    workspace: Option<PathBuf>,
+}
+
+impl ReadFileTool {
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: Some(workspace.into()),
+        }
+    }
+
+    /// Resolve the requested path: as-is when absolute, against the workspace
+    /// root when one is set, as-is otherwise.
+    fn resolve(&self, requested: &str) -> PathBuf {
+        let path = Path::new(requested);
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        match &self.workspace {
+            Some(root) => root.join(path),
+            None => path.to_path_buf(),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for ReadFileTool {
@@ -360,10 +410,10 @@ impl Tool for ReadFileTool {
             .and_then(|v| v.as_str())
             .context("Missing 'path' parameter")?;
 
-        let path = Path::new(path_str);
-        let content = tokio::fs::read_to_string(path)
+        let path = self.resolve(path_str);
+        let content = tokio::fs::read_to_string(&path)
             .await
-            .with_context(|| format!("Failed to read file: {}", path_str))?;
+            .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -632,10 +682,13 @@ impl Tool for CalculatorTool {
     }
 }
 
-/// Register the built-in tools. `workspace` bounds every file write.
+/// Register the built-in tools. `workspace` bounds every file write and
+/// anchors every relative read and shell invocation, so agents investigate
+/// the deliverable workspace rather than wherever the binary was launched.
 pub fn register_builtin_tools(registry: &mut ToolRegistry, workspace: impl Into<PathBuf>) {
-    registry.register(Arc::new(BashCommandTool));
-    registry.register(Arc::new(ReadFileTool));
+    let workspace = workspace.into();
+    registry.register(Arc::new(BashCommandTool::new(workspace.clone())));
+    registry.register(Arc::new(ReadFileTool::new(workspace.clone())));
     registry.register(Arc::new(WriteFileTool::new(workspace)));
     registry.register(Arc::new(WebFetchTool::default()));
     registry.register(Arc::new(CalculatorTool));

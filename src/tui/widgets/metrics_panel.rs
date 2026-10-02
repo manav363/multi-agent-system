@@ -3,7 +3,7 @@ use crate::metrics::tracker::MetricsTracker;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Sparkline, Table, Wrap};
 use ratatui::Frame;
 
 pub fn render_metrics_dashboard(
@@ -73,6 +73,7 @@ pub fn render_metrics_dashboard(
 
     let summary_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
         .title(Span::styled(
             " Cluster Telemetry ",
@@ -88,6 +89,7 @@ pub fn render_metrics_dashboard(
 
     let sparkline_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
         .title(Span::styled(
             " Real-time Token Throughput (tok/s) ",
@@ -107,6 +109,7 @@ pub fn render_metrics_dashboard(
     // 2. Middle Section: Per-agent metrics table
     let table_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
         .title(Span::styled(
             " Per-Agent Latency & Performance Breakdown ",
@@ -188,6 +191,7 @@ pub fn render_metrics_dashboard(
     // 3. Bottom Section: Step Waterfall Timeline
     let waterfall_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Rgb(70, 75, 90)))
         .title(Span::styled(
             " Step Execution Timeline ",

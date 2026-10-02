@@ -100,11 +100,14 @@ impl Agent {
                 "- <anything that limits the implementation, or 'none found'>\n",
                 "\n",
                 "RULES:\n",
+                "- Stay inside the workspace root named in the goal. Do not read or list anything\n",
+                "  outside it.\n",
                 "- Use `bash_command` (ls, find, grep) to discover what exists, then `read_file` on\n",
                 "  what you found. Never read a path you have not seen listed.\n",
                 "- Store anything long with `blackboard_write` and cite the key instead of pasting it.\n",
                 "- `consult_agent` asks one teammate one focused question.\n",
                 "- No narration. Do not write 'Okay, let me', 'First I will', or 'Wait'. Facts only.\n",
+                "- Do not recite these rules back. Do not propose code — facts only.\n",
                 "- Under 150 words. If the project is empty, say so in one line and stop.",
             )
             .to_string(),
@@ -194,6 +197,15 @@ impl Agent {
             system_prompt: concat!(
                 "You are the Code & Security Critic. You audit the Engineer's code.\n",
                 "\n",
+                "VERIFY FIRST — before writing any finding:\n",
+                "- The draft's files are staged in the workspace (its path is in the goal), and\n",
+                "  the orchestrator's compile check is appended to the draft. Read that check:\n",
+                "  if it reports errors, FAIL is automatic — quote its first error as your\n",
+                "  first finding and give the exact fix.\n",
+                "- Optionally verify deeper with `read_file` and `bash_command` (`cargo test`\n",
+                "  when a Cargo.toml exists). Code that does not compile, or tests that fail\n",
+                "  to compile, are automatic VERDICT: FAIL.\n",
+                "\n",
                 "OUTPUT FORMAT — exactly this, nothing before or after:\n",
                 "FINDINGS:\n",
                 "- <severity> <what is wrong> -> <the exact fix>\n",
@@ -216,7 +228,12 @@ impl Agent {
             temperature: 0.1,
             max_tokens: Some(900),
             thinking: false,
-            enabled_tools: vec![],  // NO tools — pure review
+            // Read and compile the draft — a review that cannot run the code
+            // measured as passing source with six compile errors.
+            enabled_tools: vec![
+                "read_file".to_string(),
+                "bash_command".to_string(),
+            ],
         })
     }
 
@@ -236,7 +253,10 @@ impl Agent {
                 "you only describe is saved — a file that is not written does not exist.\n",
                 "\n",
                 "THEN:\n",
-                "- Combine the implementation and the critic's fixes into one corrected version.\n",
+                "- Start from the implementation the review passed. Copy it VERBATIM unless a\n",
+                "  review finding demands a change. Do not redesign, rename, or 'improve'\n",
+                "  anything on your own — a merge that alters a signature breaks the tests the\n",
+                "  review ran.\n",
                 "- Show that same complete code in a fenced code block.\n",
                 "- Add a brief summary: what was built, key decisions, how to build and test it.\n",
                 "- Use `blackboard_read` with no key to list shared artifacts if you need them.\n",

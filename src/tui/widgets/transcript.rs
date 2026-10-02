@@ -546,9 +546,10 @@ pub fn render_transcript(
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(RULE))
         .title(Span::styled(
-            " Live Multi-Agent Workspace ",
+            " Run Log ",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),

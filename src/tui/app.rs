@@ -108,10 +108,10 @@ impl ActiveTab {
 
     pub fn title(&self) -> &'static str {
         match self {
-            ActiveTab::Studio => " [1] Agents ",
-            ActiveTab::Telemetry => " [2] Telemetry ",
-            ActiveTab::AgentsConfig => " [3] Roster ",
-            ActiveTab::Blackboard => " [4] Memory & Log ",
+            ActiveTab::Studio => "1 Agents",
+            ActiveTab::Telemetry => "2 Telemetry",
+            ActiveTab::AgentsConfig => "3 Roster",
+            ActiveTab::Blackboard => "4 Log",
         }
     }
 
@@ -175,6 +175,9 @@ pub struct App {
     /// Maps a tool call's id to its transcript index, so a result updates the
     /// call it belongs to even when the same tool is invoked twice in a step.
     pub pending_tool_calls: HashMap<String, usize>,
+    /// Maps a `write_file` call id to the path it names, so a successful write
+    /// can be listed in the deliverable pane.
+    pending_write_paths: HashMap<String, String>,
     /// Written during render so scrolling can be clamped to real content.
     pub transcript_viewport: Cell<ViewportInfo>,
     /// Agent ids in roster order.
@@ -317,6 +320,7 @@ impl App {
             workflow_cancel_token: None,
             step_progress: None,
             pending_tool_calls: HashMap::new(),
+            pending_write_paths: HashMap::new(),
             transcript_viewport: Cell::new(ViewportInfo::default()),
             context_tokens: config.context_tokens,
             session_dir: config.session_dir,
@@ -516,6 +520,22 @@ impl App {
                     self.current_streaming_thought.push_str(&delta);
                 }
 
+                // The pane's own body: every agent streams into its view, not
+                // only into the interleaved transcript. Without this the grid
+                // showed placeholders no matter how much work had happened.
+                {
+                    let view = self.view_mut(&agent_id);
+                    if is_thought {
+                        let fresh = delta.chars().any(|c| c == '\n');
+                        if fresh || (view.thought_lines == 0 && !delta.trim().is_empty()) {
+                            view.thought_lines +=
+                                delta.chars().filter(|&c| c == '\n').count() + usize::from(!fresh);
+                        }
+                    } else {
+                        view.output.push_str(&delta);
+                    }
+                }
+
                 // Append to the agent's existing block when it is still the one
                 // streaming, so one turn stays one transcript entry.
                 let appended = match self.transcript_items.last_mut() {
@@ -588,6 +608,17 @@ impl App {
                     duration_ms: 0,
                 });
 
+                // Remember which path a write names, so the deliverable pane
+                // can list the file the moment the write succeeds.
+                if tool_name == "write_file" {
+                    let path = serde_json::from_str::<serde_json::Value>(&args)
+                        .ok()
+                        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from));
+                    if let Some(path) = path {
+                        self.pending_write_paths.insert(call_id.clone(), path);
+                    }
+                }
+
                 self.mark_last_output_finished();
                 self.push_transcript(TranscriptItem::ToolExecution {
                     agent_name,
@@ -603,6 +634,7 @@ impl App {
             }
             OrchestratorEvent::ToolCallFinished {
                 agent_id,
+                tool_name,
                 call_id,
                 result,
                 is_error,
@@ -610,6 +642,14 @@ impl App {
                 ..
             } => {
                 self.metrics.on_tool_finished(&agent_id, duration_ms);
+
+                if !is_error && tool_name == "write_file" {
+                    if let Some(path) = self.pending_write_paths.remove(&call_id) {
+                        if !self.files_written.contains(&path) {
+                            self.files_written.push(path);
+                        }
+                    }
+                }
 
                 // Look the entry up by call id. Matching on tool name alone
                 // wrote a result into the first call with that name, which is
@@ -663,6 +703,8 @@ impl App {
                 start_offset_ms,
                 tokens,
                 tool_calls,
+                success,
+                output_preview,
                 ..
             } => {
                 let agent_name = self
@@ -671,29 +713,37 @@ impl App {
                     .get(&agent_id)
                     .map(|a| a.config.name.clone())
                     .unwrap_or_default();
-                // Copy the metrics out before touching the views, so the
-                // immutable borrow of `metrics` ends first.
-                let m = self.metrics.agent_metrics.get(&agent_id);
-                let (ttft_ms, avg_tps) = (m.and_then(|x| x.ttft_ms), m.map(|x| x.avg_tps));
 
                 {
                     let view = self.view_mut(&agent_id);
                     view.finish_step(duration_ms);
                     view.tool_calls += tool_calls;
+                    if !success {
+                        // The retry ladder gave up: show why on the pane
+                        // instead of a spinner that never resolves.
+                        view.error = Some(output_preview.clone());
+                    }
                 }
 
-                self.metrics.add_waterfall_span(WaterfallSpan {
-                    step_index,
-                    title: title.clone(),
-                    agent_id: agent_id.clone(),
-                    agent_name,
-                    start_offset_ms,
-                    duration_ms,
-                    ttft_ms,
-                    tokens_generated: tokens,
-                    avg_tps: avg_tps.unwrap_or(0.0),
-                    tool_calls_count: tool_calls,
-                });
+                if success {
+                    // Copy the metrics out before touching the views, so the
+                    // immutable borrow of `metrics` ends first.
+                    let m = self.metrics.agent_metrics.get(&agent_id);
+                    let (ttft_ms, avg_tps) = (m.and_then(|x| x.ttft_ms), m.map(|x| x.avg_tps));
+
+                    self.metrics.add_waterfall_span(WaterfallSpan {
+                        step_index,
+                        title: title.clone(),
+                        agent_id: agent_id.clone(),
+                        agent_name,
+                        start_offset_ms,
+                        duration_ms,
+                        ttft_ms,
+                        tokens_generated: tokens,
+                        avg_tps: avg_tps.unwrap_or(0.0),
+                        tool_calls_count: tool_calls,
+                    });
+                }
 
                 // Stamp the duration onto this step's milestone. Steps are
                 // matched by index, not title — two topologies reuse titles.
@@ -714,11 +764,15 @@ impl App {
             OrchestratorEvent::WorkflowOverallCompleted {
                 total_duration_ms,
                 total_tokens,
+                summary,
                 ..
             } => {
                 self.is_running_workflow = false;
                 self.workflow_cancel_token = None;
                 self.step_progress = None;
+                if !summary.trim().is_empty() {
+                    self.deliverable = summary;
+                }
                 self.mark_last_output_finished();
                 self.push_transcript(TranscriptItem::Notice {
                     level: NoticeLevel::Success,
@@ -1035,6 +1089,7 @@ impl App {
 
                         self.metrics.start_workflow();
                         self.pending_tool_calls.clear();
+                        self.pending_write_paths.clear();
                         for view in self.agent_views.values_mut() {
                             view.clear();
                         }

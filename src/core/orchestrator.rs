@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -108,6 +108,9 @@ impl StepRunner {
     ) -> Result<StepOutcome> {
         const MAX_RETRIES: u32 = 2;
         let mut last_error = None;
+        let first_attempt = Instant::now();
+        let start_offset_ms = self.workflow_start.elapsed().as_millis() as u64;
+        let agent_id = agent.config.id.clone();
 
         for attempt in 0..=MAX_RETRIES {
             if self.cancel.is_cancelled() {
@@ -154,7 +157,27 @@ impl StepRunner {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error")))
+        let failure = last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error"));
+
+        // A step that exhausted its retries still belongs in the timeline —
+        // the UI marks the agent's pane failed from this event rather than
+        // leaving a spinner on a step that will never finish.
+        if !self.cancel.is_cancelled() {
+            self.emit(OrchestratorEvent::WorkflowStepFinished {
+                step_index,
+                title: title.to_string(),
+                agent_id,
+                duration_ms: first_attempt.elapsed().as_millis() as u64,
+                start_offset_ms,
+                tokens: 0,
+                tool_calls: 0,
+                success: false,
+                output_preview: preview_line(&format!("{failure:#}"), 160),
+                timestamp: Utc::now(),
+            });
+        }
+
+        Err(failure)
     }
 
     async fn run(
@@ -512,6 +535,12 @@ pub struct Orchestrator {
     workspace: Option<PathBuf>,
     /// Files the workflow saved, so the fallback only runs when nothing did.
     files_written: Arc<AtomicUsize>,
+    /// Whether the staged draft compiles. `None` until a Rust draft has been
+    /// checked (or no check was possible).
+    draft_compiles: Option<bool>,
+    /// The compiler's output for the staged draft, shown to the reviewer and
+    /// the synthesizer.
+    draft_build_log: String,
 }
 
 impl Orchestrator {
@@ -543,6 +572,8 @@ impl Orchestrator {
             step_outputs: Vec::new(),
             workspace: None,
             files_written: Arc::new(AtomicUsize::new(0)),
+            draft_compiles: None,
+            draft_build_log: String::new(),
         };
         orchestrator.register_coordination_tools();
         orchestrator
@@ -627,6 +658,8 @@ impl Orchestrator {
         self.total_tokens = 0;
         self.agent_token_totals.clear();
         self.step_outputs.clear();
+        self.draft_compiles = None;
+        self.draft_build_log.clear();
         self.blackboard.clear().await;
         self.blackboard.set("user_goal", user_goal).await;
 
@@ -719,7 +752,7 @@ impl Orchestrator {
                 .run_with_retry(agent, index, spec.title, prompt)
                 .await;
             let outcome = self.report_failure(outcome, index, spec.title);
-            self.absorb(spec.id, outcome, outputs).await;
+            self.absorb(spec.id, outcome, outputs, user_goal).await;
             return Ok(step_index);
         }
 
@@ -744,7 +777,7 @@ impl Orchestrator {
 
         for (spec, index, outcome) in results {
             let outcome = self.report_failure(outcome, index, spec.title);
-            self.absorb(spec.id, outcome, outputs).await;
+            self.absorb(spec.id, outcome, outputs, user_goal).await;
         }
 
         Ok(step_index)
@@ -778,6 +811,7 @@ impl Orchestrator {
         step_id: &str,
         outcome: Result<StepOutcome>,
         outputs: &mut HashMap<String, String>,
+        user_goal: &str,
     ) {
         let output = match outcome {
             Ok(o) => {
@@ -794,8 +828,22 @@ impl Orchestrator {
                     timestamp: Utc::now(),
                 });
 
+                // The Engineer's draft exists only as text until it lands on
+                // disk, which left the Critic reviewing prose about code it
+                // could not run. Stage the draft's files, compile them, and
+                // carry the compiler's verdict forward: the review sees real
+                // evidence, and a draft that does not compile cannot pass it.
+                let mut output = o.output;
+                if o.agent.config.role == AgentRole::Coder {
+                    self.stage_and_verify_draft(user_goal, &output).await;
+                    if !self.draft_build_log.is_empty() {
+                        output.push_str("\n\n--- compile check (run by the orchestrator) ---\n");
+                        output.push_str(&self.draft_build_log);
+                    }
+                }
+
                 self.agents.insert(agent_id, o.agent);
-                o.output
+                output
             }
             Err(e) => format!(
                 "[Step '{step_id}' did not complete: {e:#}. Continuing with available context.]"
@@ -805,6 +853,93 @@ impl Orchestrator {
         self.blackboard.set(step_id, &output).await;
         outputs.insert(step_id.to_string(), output.clone());
         self.step_outputs.push((step_id.to_string(), output));
+    }
+
+    /// Write the files a draft describes into the workspace, ahead of review,
+    /// and type-check what was written.
+    ///
+    /// Staged files do not count as agent writes: `files_written` gates the
+    /// end-of-run recovery, which must still fire when no agent saved the
+    /// merged deliverable itself.
+    async fn stage_and_verify_draft(&mut self, user_goal: &str, output: &str) {
+        let Some(workspace) = &self.workspace else {
+            return;
+        };
+
+        let default_path = crate::core::text::filename_hint(user_goal)
+            .unwrap_or_else(|| "deliverable.txt".to_string());
+        let files = extract_files(output, &default_path);
+        if files.is_empty() {
+            return;
+        }
+
+        let writer = crate::tools::builtins::WriteFileTool::new(workspace.clone());
+        let mut staged = Vec::new();
+        for file in files {
+            let args = serde_json::json!({ "path": file.path, "content": file.content });
+            match writer.execute(args).await {
+                Ok(_) => staged.push(file.path),
+                Err(e) => self.emit(OrchestratorEvent::SystemLog {
+                    level: "WARN".to_string(),
+                    target: "Review".to_string(),
+                    message: format!("Could not stage {}: {e:#}", file.path),
+                    timestamp: Utc::now(),
+                }),
+            }
+        }
+
+        if staged.is_empty() {
+            return;
+        }
+        self.emit(OrchestratorEvent::SystemLog {
+            level: "INFO".to_string(),
+            target: "Review".to_string(),
+            message: format!(
+                "Draft staged to {} for review: {}",
+                workspace.display(),
+                staged.join(", ")
+            ),
+            timestamp: Utc::now(),
+        });
+
+        self.draft_compiles = None;
+        self.draft_build_log.clear();
+        let rust: Vec<String> = staged
+            .iter()
+            .filter(|p| p.ends_with(".rs"))
+            .cloned()
+            .collect();
+        if rust.is_empty() {
+            return;
+        }
+
+        match compile_rust_draft(workspace, &rust).await {
+            Some((true, log)) => {
+                self.draft_compiles = Some(true);
+                self.draft_build_log = log;
+            }
+            Some((false, log)) => {
+                self.draft_compiles = Some(false);
+                self.draft_build_log = log;
+                self.emit(OrchestratorEvent::SystemLog {
+                    level: "WARN".to_string(),
+                    target: "Review".to_string(),
+                    message: "Draft does not compile — the review verdict will be forced to FAIL."
+                        .to_string(),
+                    timestamp: Utc::now(),
+                });
+            }
+            None => {
+                // No rustc on the host: say so and let the review proceed on
+                // judgement alone, exactly as before this check existed.
+                self.emit(OrchestratorEvent::SystemLog {
+                    level: "INFO".to_string(),
+                    target: "Review".to_string(),
+                    message: "rustc not found; skipping the compile check.".to_string(),
+                    timestamp: Utc::now(),
+                });
+            }
+        }
     }
 
     /// Revise and re-review while the verdict is a failure.
@@ -818,10 +953,26 @@ impl Orchestrator {
         for round in 1..=review.max_rounds {
             self.check_cancelled()?;
 
-            let verdict = outputs
-                .get(review.verdict_step)
-                .map(|t| Verdict::parse(t))
-                .unwrap_or(Verdict::Pass);
+            // The compiler's evidence outranks the reviewer's word: measured
+            // on a live run, a small critic model returned `VERDICT: PASS` in
+            // 24 tokens on a draft with six compile errors. A draft that
+            // provably does not compile fails the review no matter what the
+            // critic says.
+            let verdict = if self.draft_compiles == Some(false) {
+                self.emit(OrchestratorEvent::SystemLog {
+                    level: "WARN".to_string(),
+                    target: "Orchestrator".to_string(),
+                    message: "Compile check failed — overriding the review verdict to FAIL."
+                        .to_string(),
+                    timestamp: Utc::now(),
+                });
+                Verdict::Fail
+            } else {
+                outputs
+                    .get(review.verdict_step)
+                    .map(|t| Verdict::parse(t))
+                    .unwrap_or(Verdict::Pass)
+            };
             if verdict == Verdict::Pass {
                 break;
             }
@@ -856,7 +1007,8 @@ impl Orchestrator {
                 .await;
             let outcome = self.report_failure(outcome, step_index, review.revise_title);
             let revision_failed = outcome.is_err();
-            self.absorb(review.revises_step, outcome, outputs).await;
+            self.absorb(review.revises_step, outcome, outputs, user_goal)
+                .await;
             if revision_failed {
                 break;
             }
@@ -885,7 +1037,7 @@ impl Orchestrator {
                 .await;
             let outcome = self.report_failure(outcome, step_index, spec.title);
             let review_failed = outcome.is_err();
-            self.absorb(spec.id, outcome, outputs).await;
+            self.absorb(spec.id, outcome, outputs, user_goal).await;
             if review_failed {
                 break;
             }
@@ -904,7 +1056,14 @@ impl Orchestrator {
         outputs: &HashMap<String, String>,
         agent: &Agent,
     ) -> String {
-        let mut sections = vec![Section::essential("Goal", user_goal)];
+        // The workspace anchors every file operation: without it a scout told
+        // to "investigate the project" lists the orchestra's own repository,
+        // and a critic has nowhere to compile the draft.
+        let goal_with_ws = match &self.workspace {
+            Some(ws) => format!("{user_goal}\n\nWorkspace root: {}", ws.display()),
+            None => user_goal.to_string(),
+        };
+        let mut sections = vec![Section::essential("Goal", goal_with_ws)];
 
         // Later dependencies are the more immediate context, so they outrank
         // earlier ones when space runs short.
@@ -1016,6 +1175,67 @@ fn label_for(step_id: &str) -> String {
         Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
         None => step_id.to_string(),
     }
+}
+
+/// Type-check a staged Rust draft with `rustc`.
+///
+/// `--test` includes the `#[cfg(test)]` module — measured on a live run, the
+/// Synthesizer's merge broke the tests themselves while the library half
+/// still compiled. `--emit=metadata` skips codegen, which is all a verdict
+/// needs. Each file is checked on its own because a staged draft is not a
+/// crate. Returns `None` when no compiler is installed.
+async fn compile_rust_draft(
+    workspace: &std::path::Path,
+    files: &[String],
+) -> Option<(bool, String)> {
+    const ERRORS_KEPT: usize = 15;
+
+    let mut log = String::new();
+    let mut all_ok = true;
+
+    for file in files {
+        let mut cmd = tokio::process::Command::new("rustc");
+        cmd.args([
+            "--edition",
+            "2021",
+            "--test",
+            "--emit=metadata",
+            file.as_str(),
+        ])
+        .current_dir(workspace)
+        .kill_on_drop(true);
+
+        let attempt = tokio::time::timeout(Duration::from_secs(90), cmd.output()).await;
+        match attempt {
+            Ok(Ok(out)) if out.status.success() => {
+                log.push_str(&format!("✓ rustc --test {file} — compiles\n"));
+            }
+            Ok(Ok(out)) => {
+                all_ok = false;
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                log.push_str(&format!("✗ rustc --test {file} — errors:\n"));
+                for line in stderr.lines().take(ERRORS_KEPT) {
+                    log.push_str(line);
+                    log.push('\n');
+                }
+                let total = stderr.lines().count();
+                if total > ERRORS_KEPT {
+                    log.push_str(&format!("… {} more lines\n", total - ERRORS_KEPT));
+                }
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Ok(Err(e)) => {
+                all_ok = false;
+                log.push_str(&format!("✗ could not run rustc for {file}: {e}\n"));
+            }
+            Err(_) => {
+                all_ok = false;
+                log.push_str(&format!("✗ rustc timed out on {file} after 90s\n"));
+            }
+        }
+    }
+
+    Some((all_ok, log))
 }
 
 /// A critic's judgement on the work it reviewed.

@@ -20,7 +20,7 @@
 <tr>
 <td width="50%">
 
-**5.3 MB single binary** · **~10,700 lines of Rust** · **170 tests** · **Zero Python, Zero Node.js**
+**5.3 MB single binary** · **~10,700 lines of Rust** · **177 tests** · **Zero Python, Zero Node.js**
 
 Agent Orchestra coordinates specialized AI agents — **Researcher**, **Planner**, **Engineer**, **Critic**, and **Synthesizer** — across dependency-graph topologies to solve programming and architectural tasks using **your local models**. Independent agents run concurrently, a failing review triggers a bounded revision round, and the Synthesizer writes the result to disk. No API keys. No cloud. No telemetry.
 
@@ -28,20 +28,18 @@ Agent Orchestra coordinates specialized AI agents — **Researcher**, **Planner*
 <td width="50%">
 
 ```
-┌ Models (3) ─────┐┌ Goal ─────────────────────┐┌ Hierarchical ──┐
-│ qwen2.5-coder…  ││ Implement an LRU cache…   ││ STEP 3/7 · 42s │
-└─────────────────┘└───────────────────────────┘└────────────────┘
- [1] Agents · [2] Telemetry · [3] Roster · [4] Memory & Log
-╔ Researcher ═══════╗┌ Planner ─────────┐┌ Engineer ────────┐
-║🔍 Scout      DONE ║│📋 Architect DONE ││⚡ Engineer ⠹STREAM│
-║● ok · llama3.2:3b ║│● ok · qwen3:4b   ││● ok · qwen2.5… 7b│
-║  ttft 890ms 19t/s ║│  ttft 6.0s 20t/s ││  ttft 1.2s 19t/s │
-║✓ read_file  12ms  ║│💭 14 lines       ││ pub fn get(&self)│
-╚═══════════════════╝└──────────────────┘└──────────────────┘
-┌ Critic ───────────┐┌ Synthesizer ─────┐┌ Deliverable ─────┐
-│🛡️ Critic     IDLE  ││✨ Synth      IDLE ││ ✓ src/lru.rs     │
-│○ idle · qwen2.5…  ││○ idle · qwen2.5… ││ pub struct Lru…  │
-└───────────────────┘└──────────────────┘└──────────────────┘
+⚡ orchestra   1 Agents │ 2 Telemetry │ 3 Roster │ 4 Log      Hierarchical Swarm · 3 models   ● STEP 3/7 42s
+╭─ 🔍 Research Scout ── DONE ─╮╭─ 📋 Lead Architect ── IDLE ╮╭─ ⚡ Systems Engineer ⠹ STREAM ─╮
+│ done in 18s                ││                            ││ 12s                          │
+│ ● ok · llama3.2:3b         ││ ○ idle · qwen3:4b          ││ ● ok · qwen2.5-coder:7b      │
+│  ttft 890ms 19t/s          ││                            ││  ttft 1.2s 19t/s             │
+│ ✓ bash_command  12ms       ││                            ││ pub fn get(&self, key: &K)   │
+╰────────────────────────────╯╰────────────────────────────╯╰──────────────────────────────╯
+╭─ 🛡️ Code & Security Critic ╮╭─ ✨ Executive Synthesizer ╮╭─ ✨ Deliverable ──────────────╮
+│ ○ idle · qwen2.5-coder:7b  ││ ○ idle · qwen2.5…         ││ ✓ src/lru.rs                 │
+│                            ││                           ││ pub struct Lru…              │
+╰────────────────────────────╯╰───────────────────────────╯╰──────────────────────────────╯
+ ❯ press i to type a goal…                            [i] goal · [t] topology · [m] model · [?] help
 ```
 
 </td>
@@ -104,6 +102,7 @@ Orchestra inspects the models you have installed and assigns each role automatic
 ### Orchestration
 - **Dependency-graph topologies** — steps declare what they depend on; the executor derives the order and runs independent steps concurrently on a `JoinSet`.
 - **Bounded revision loop** — the Critic ends its review with `VERDICT: PASS` / `VERDICT: FAIL`. On a failure the Engineer revises and the Critic re-reviews, up to a per-topology cap.
+- **Reviews that run the code** — the Engineer's draft is staged into the workspace and compiled (`rustc --test`) before review; the compiler's output is appended to what the Critic sees, and a draft that fails to compile **fails the review outright**, whatever the critic says. Broken code earns a revision round instead of a pass.
 - **Context budgeting** — prompts are assembled to fit the window. Carried-forward artifacts are shortened (head and tail kept) before the server can truncate them silently; the goal and instruction are never trimmed.
 - **Per-step recovery** — up to two retries with backoff, including for steps running concurrently. A step that never succeeds degrades to a marker instead of aborting the workflow.
 - **Runaway guards** — generation is capped by `num_predict`, exact repetition loops are cut short, and a character budget bounds anything subtler.
@@ -119,11 +118,12 @@ Orchestra inspects the models you have installed and assigns each role automatic
 - **Reasoning models** — `<think>` tags and Ollama's `thinking` field are parsed and kept out of the deliverable. Reasoning is **off by default**; see [Getting Good Output](#-getting-good-output).
 
 ### Interactive Terminal UI
+- **One header line, one footer line** — the header carries the brand, the four views and live run status; the footer holds the goal input and key hints. Every row between them belongs to the agents.
 - **Every agent on screen at once** — the grid sizes itself to the roster, so a five-agent roster tiles as 3×2 and a four-agent one as 2×2, each cell the same size. Narrow terminals drop a column rather than squeezing panes unreadable.
 - **Each pane carries its agent's health** — a connectivity dot judged from evidence (offline / failed / idle / ok), the model it runs on, TTFT, throughput, token count, live tool activity with timing, and a running step timer.
-- **The goal input spans the top**, with the models in play beside it and run progress on the right.
+- **Each pane streams its agent's output** — what you watch is the model's own tokens, tailed live, not a placeholder.
 - **Deliverable pane** — the spare grid cell holds the finished answer and the files written. Press `z` to zoom any pane full-screen; a sixth of a terminal cannot show a deliverable.
-- **Four views** — Agents · Telemetry · Roster · Memory & Log. On the grid, `Tab` walks panes; elsewhere it switches views.
+- **Four views** — Agents · Telemetry · Roster · Log. On the grid, `Tab` walks panes; elsewhere it switches views.
 - **Editable prompts** — press `e` on the Roster tab to edit an agent's system prompt and `Ctrl+S` to save it back to your roster file.
 - **Telemetry** — TTFT, throughput sparkline, per-agent table and a real Gantt timeline showing which steps overlapped.
 
@@ -145,8 +145,8 @@ Orchestra inspects the models you have installed and assigns each role automatic
 
 ```
                     ┌──────────────────────────────────────────┐
-                    │        Terminal UI — agent grid          │
-                    │   goal bar · one pane per agent · ~16 Hz │
+                    │  header / footer · one pane per agent    │
+                    │   goal input · live status · ~16 Hz      │
                     └──────────────┬───────────────────────────┘
                                    │ Async MPSC Event Stream
                     ┌──────────────▼───────────────────────────┐
@@ -283,6 +283,10 @@ cargo build --release
 # Fast path for a well-specified task
 ./target/release/orchestra -t direct -p "Write a Rust binary search with tests"
 
+# Headless mode streams tokens while one agent generates; when a level runs
+# several agents in parallel it prints each step's result instead, so the
+# output never interleaves into gibberish.
+
 # Compare topologies on the same goal
 ./target/release/orchestra \
   --benchmark direct,pipeline,hierarchical \
@@ -406,10 +410,10 @@ Other:
 
 ## 🧪 Testing
 
-170 tests, none of which need a model server — a scripted `MockProvider` replays turns, tool calls, usage, failures and delays, so topology order, retries, the tool gate, the context budget and the revision loop are all covered offline.
+177 tests, none of which need a model server — a scripted `MockProvider` replays turns, tool calls, usage, failures and delays, so topology order, retries, the tool gate, the context budget and the revision loop are all covered offline.
 
 ```bash
-cargo test                 # all 170
+cargo test                 # all 177
 cargo test -- --nocapture  # with output
 cargo clippy --all-targets # lint
 cargo fmt --check          # formatting
