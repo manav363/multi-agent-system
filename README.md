@@ -12,6 +12,9 @@
     <a href="#-topologies"><img src="https://img.shields.io/badge/topologies-green?style=for-the-badge" alt="Topologies"></a>
     <a href="#-getting-good-output"><img src="https://img.shields.io/badge/tuning_guide-orange?style=for-the-badge" alt="Tuning Guide"></a>
   </p>
+  <p align="center">
+    <a href="https://github.com/manav363/multi-agent-system/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/manav363/multi-agent-system/ci.yml?branch=main&label=CI" alt="CI"></a>
+  </p>
 </p>
 
 <br>
@@ -20,7 +23,7 @@
 <tr>
 <td width="50%">
 
-**5.3 MB single binary** · **~10,700 lines of Rust** · **177 tests** · **Zero Python, Zero Node.js**
+**Single ~5–7 MB binary** · **~13,000 lines of Rust** · **177 tests** · **Zero Python, Zero Node.js**
 
 Agent Orchestra coordinates specialized AI agents — **Researcher**, **Planner**, **Engineer**, **Critic**, and **Synthesizer** — across dependency-graph topologies to solve programming and architectural tasks using **your local models**. Independent agents run concurrently, a failing review triggers a bounded revision round, and the Synthesizer writes the result to disk. No API keys. No cloud. No telemetry.
 
@@ -48,12 +51,21 @@ Agent Orchestra coordinates specialized AI agents — **Researcher**, **Planner*
 
 ---
 
-## Why Agent Orchestra?
+## Design choices
 
-Most multi-agent frameworks are Python-based, cloud-dependent, and hide what the models are actually doing.
+| | |
+|---|---|
+| **Language** | Rust: agent steps run as concurrent tasks on a Tokio runtime, and one failing task cannot take the terminal UI down. |
+| **Distribution** | A single binary (roughly 5–7 MB depending on platform), no Python or Node runtime. |
+| **Cloud** | None required. It talks to a local model server (Ollama by default; OpenAI-compatible, llama.cpp, vLLM and LM Studio backends are also supported). |
+| **UI** | Every agent is visible at once on one terminal screen, each pane streaming its own model's tokens. |
+| **Concurrency** | Steps declare dependencies; independent steps run concurrently, level by level. |
+| **Context overflow** | Prompts are budgeted to fit the window and truncation is reported instead of happening silently on the server. |
+| **Runaway generation** | Capped by `num_predict`, repetition detection and a character budget. |
+| **Tool safety** | A deny-list for shell commands and workspace-confined file writes (a guard, not a jail; see [Known limitations](#-known-limitations)). |
+| **Reproducibility** | Every run is saved as a session record; benchmark mode compares topologies on one goal. |
 
-| | **CrewAI / AutoGen** | **Agent Orchestra** |
-|---|---|---|
+---|---|---|
 | **Language** | Python (GIL-bound) | **Rust** (true parallelism) |
 | **Distribution** | `pip install` + virtualenv | **Single 5MB binary** |
 | **Cloud Required** | Usually (API keys) | **Never** (Ollama-native) |
@@ -312,7 +324,7 @@ $EDITOR ./roster.json
 
 ## 🎯 Getting Good Output
 
-Local models are the limiting factor, not the orchestration. These are measured on this repository, not guessed.
+Local models are the limiting factor, not the orchestration. The figures below come from the author's own runs with the models named; the raw session records are not committed, so treat them as observations rather than a reproducible benchmark. `--benchmark` reruns the comparison on your own models.
 
 **1. Match the topology to the task.** More agents is not better. On a well-specified goal the five-agent pipeline was *slower and worse* than a single Engineer, because a shaky plan gets implemented faithfully. Use `direct` for "write function X"; use `hierarchical` when the goal is vague or spans several files.
 
@@ -458,6 +470,21 @@ src/
 │   └── tracker.rs             # TTFT, TPS, token reconciliation, waterfall spans
 └── tests.rs                   # End-to-end orchestration tests against MockProvider
 ```
+
+---
+
+## 🚧 Known limitations
+
+- **Tests do not exercise a real model.** The 177 tests drive a scripted `MockProvider`, so orchestration logic is covered offline; behaviour with real models comes from the author's runs and is described in [Getting Good Output](#-getting-good-output).
+- **The compile check covers Rust drafts only**, and only type-checks them (`rustc --test --emit=metadata`); a draft that compiles can still be wrong. If `rustc` is not installed the check is skipped and the review proceeds without it.
+- **The shell guard is a deny-list, not a sandbox** (see above). Run the binary in a container or under a dedicated user for a real boundary.
+- **Dependency notes.** The lockfile is audited in CI with `cargo audit`, which fails on known vulnerabilities. It currently reports warnings only for transitive crates: `paste` (unmaintained) and `lru` (unsound `IterMut` / `pop`), both pulled in by `ratatui` 0.29, and `meval` depends on `nom` 1.x, which rustc flags as incompatible with a future Rust release.
+
+---
+
+## How this was built
+
+Agent Orchestra was built with AI coding assistance (Claude Code). What can be checked without taking that on trust is in the repository: `cargo clippy -D warnings`, `cargo fmt --check`, the offline test suite and `cargo audit`, all run in CI.
 
 ---
 
